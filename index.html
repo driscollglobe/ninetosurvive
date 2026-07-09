@@ -7,8 +7,1058 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-<script src="ntos-game.js?v=n4"></script>
-<script src="ntos-world.js?v=w2"></script>
+<script>
+/* ntos-game.js — Nine to Survive: Your Number · pure game brain (no DOM)
+ *
+ * The logic-and-data module, mirroring MARQUE's sim/world split: this file owns the
+ * encounter content and the deterministic rules (meters, days, money, the ladder,
+ * fail states, verdicts); the shell (index.html) owns presentation only and never
+ * re-implements rules here. Deterministic given a seed (mulberry32 on g.rngState,
+ * no bare Math.random) so game-test.js can assert entire careers headlessly.
+ *
+ * The run: survive workday after workday of encounter cards, get paid daily, get
+ * promoted at Friday reviews, and bank FU_TARGET ("your number") to walk out — the
+ * win. Standing 0 = managed out. Soul 0 = promoted to management. Both are endings.
+ *
+ * Loaded in the browser via <script src>; also eval-loaded headlessly by game-test.js.
+ */
+const NineToSurvive = (() => {
+  // Starting state. Standing = how the org sees you; Soul = how much of you is left;
+  // Money = the walk-out fund.
+  const START = { standing: 50, soul: 65, money: 300 };
+
+  // A fixed 9-to-5: ten encounters in clock order. Each choice moves Standing (s) and
+  // Soul (so); (o) is the outcome line. The third choice is usually the "keep both alive"
+  // path — the game's whole thesis.
+  const ENCOUNTERS = [
+    {
+      tag:"9:03 · Useless Meeting Survivor", clock:"9:03",
+      title:"The Sync With No Agenda",
+      scene:"A 30-minute “quick sync” lands on your calendar. Organizer: someone two levels up. Agenda: blank. Attendees: eleven. It starts in four minutes.",
+      choices:[
+        {t:"Join, camera on, nod thoughtfully for thirty minutes.", s:8, so:-6, o:"You said “great point, let’s align on that” twice. Nobody knows what was decided. But you looked engaged, and looking engaged is the job."},
+        {t:"Decline: “Could this be an email?”", s:-10, so:12, o:"The organizer replies “let’s discuss live.” There is no live. You’ve made an enemy and, more importantly, a point."},
+        {t:"Join muted, camera off, do actual work.", s:2, so:3, o:"You got a real hour of work done while appearing present. This is the closest thing to a win this building offers."}
+      ]
+    },
+    {
+      tag:"9:41 · Office Bully Resistance", clock:"9:41",
+      title:"Credit, Reassigned",
+      scene:"In standup, Brad presents your analysis. Word for word. Your name never comes up. The boss says, “Great initiative, Brad.”",
+      choices:[
+        {t:"Let it go. Pick your battles.", s:0, so:-13, o:"You said nothing. Brad is now “the data guy.” You are now the person who lets Brad be the data guy. Both titles stick."},
+        {t:"“Actually I built that — happy to walk everyone through it.”", s:6, so:11, o:"The room goes quiet in the good way. Brad suddenly needs to check his phone. Noted, respected, and very slightly feared."},
+        {t:"DM the boss after: “FYI, that was my analysis.”", s:3, so:-2, o:"The boss replies “👍.” It’ll happen again. But the 👍 is, technically, a record. You’re building a folder."}
+      ]
+    },
+    {
+      tag:"10:22 · The Ambush", clock:"10:22",
+      title:"“You have a sec? Quick call.”",
+      scene:"The boss Slacks: “you free? quick call.” No topic. No agenda. Your stomach does the thing it does.",
+      choices:[
+        {t:"“Sure! calling now 😊”", s:5, so:-5, o:"It was to ask if you’d seen the new coffee machine. You lost fourteen minutes and a small, non-refundable piece of yourself."},
+        {t:"“Happy to — what’s it about so I can prep?”", s:-2, so:7, o:"“oh, nothing major.” It was nothing major. You’ve now trained the boss, faintly, that you require a topic. Small, real win."},
+        {t:"Wait 20 min, then: “In a meeting — can I help async?”", s:-1, so:4, o:"Async worked fine. It always would have. The call was never necessary. The call is never necessary."}
+      ]
+    },
+    {
+      tag:"11:15 · Mandatory Fun", clock:"11:15",
+      title:"Virtual Team Trivia",
+      scene:"HR has scheduled team-bonding trivia. Attendance is “optional (strongly encouraged).” Cameras are “expected.”",
+      choices:[
+        {t:"Show up, be peppy, win the trivia.", s:7, so:-8, o:"You’re now “so fun.” You will be invited to all of these forever. This is a trap wearing the costume of a compliment."},
+        {t:"“Conflict, sorry!” Reclaim the hour.", s:-6, so:9, o:"There was no conflict. There is now an hour. HR logs you “low engagement.” You log yourself “a whole person.”"},
+        {t:"Show up, answer one question, ghost at fifteen minutes.", s:1, so:0, o:"Minimum viable morale. Present enough to be seen, gone before your soul got billed. Textbook."}
+      ]
+    },
+    {
+      tag:"12:30 · I Don’t Give a Sheet", clock:"12:30",
+      title:"“Let’s Take This Offline”",
+      scene:"In a thread where you’re clearly right, someone senior writes: “Great points — let’s take this offline.” The offline will never happen. The record now ends with them sounding reasonable.",
+      choices:[
+        {t:"“Sounds good!”", s:3, so:-6, o:"It went offline. It died offline. Their version is the version now, and you helped bury the evidence."},
+        {t:"“Sure — I’ll post a quick summary here first.” Then post it.", s:2, so:9, o:"The receipts are now in the channel, timestamped. “Offline” is where accountability goes to die, and you just kept it breathing."},
+        {t:"Say nothing. Screenshot everything.", s:0, so:3, o:"You have a folder now. It’s a coping mechanism and an insurance policy. Mostly a coping mechanism."}
+      ]
+    },
+    {
+      tag:"1:45 · The Invisible Labor", clock:"1:45",
+      title:"“Can Someone Take Notes?”",
+      scene:"The meeting opens. “Can someone grab notes?” Eleven people. Silence. Every head turns, subtly, toward you.",
+      choices:[
+        {t:"Take the notes. Again.", s:2, so:-9, o:"You’re the notes person now. Notes people get thanked. Notes people don’t get promoted. The difference is your career."},
+        {t:"“I took them last time — maybe we rotate?”", s:-1, so:8, o:"The silence goes loud. Someone else gets volun-told. You’ve broken an ancient curse, and everyone in the room noticed."},
+        {t:"“Happy to — I’ll share them so we’re all accountable.”", s:4, so:2, o:"You turned the invisible-labor trap into leverage. The notes are yours now, and so is the record of who promised what."}
+      ]
+    },
+    {
+      tag:"2:30 · Senior Job Hugger", clock:"2:30",
+      title:"Dennis Has Questions",
+      scene:"You need one approval to ship. It sits with Dennis. Dennis has kept this job nineteen years by never approving anything on the first ask. Dennis “has some questions.”",
+      choices:[
+        {t:"Answer all fourteen questions in a two-page reply.", s:2, so:-7, o:"Dennis now has six follow-up questions. Dennis is not a bottleneck. Dennis is the pipe."},
+        {t:"Loop in Dennis’s boss: “Trying to unblock — can you help?”", s:5, so:3, o:"Dennis approves in nine minutes, wounded and vengeful. You shipped. Dennis will “have questions” about your next twelve things."},
+        {t:"Wait him out. Resend the same request, cheerful, daily.", s:0, so:5, o:"Day three, Dennis breaks. Persistence beats a job-hugger, because he’s tired and you have a folder of cheerful timestamps."}
+      ]
+    },
+    {
+      tag:"3:15 · The Noun", clock:"3:15",
+      title:"“Great for Your Visibility”",
+      scene:"The boss: “Big client thing this weekend — would be huge for your visibility if you jumped in.” No extra pay. Just the noun.",
+      choices:[
+        {t:"“Absolutely, count me in!”", s:9, so:-13, o:"You traded a weekend for a noun. “Visibility” is what they offer when they’ve run out of money and shame. You’re now visible and tired."},
+        {t:"“I’ve got plans — happy to help Monday.”", s:-8, so:13, o:"“No worries!” (worries.) You kept your weekend and your kid’s game. Somehow the client thing gets done without you. It always does."},
+        {t:"“I can do two hours Saturday morning, then I’m out.”", s:2, so:-1, o:"Bounded it. Two hours, hard stop, stated up front. Not a martyr, not a no. The rarest move in the building: a limit."}
+      ]
+    },
+    {
+      tag:"4:05 · The Self-Assessment", clock:"4:05",
+      title:"Rate Your Own Performance",
+      scene:"Annual review. Rate yourself 1–5 and “provide evidence.” Too high: arrogant. Too low: they’ll believe you.",
+      choices:[
+        {t:"A modest 3. Stay humble.", s:-4, so:-3, o:"You wrote “3 — met expectations.” They met your low expectations of yourself and adjusted the raise to match. Humility is a pay cut."},
+        {t:"A 5, with every win and the receipts.", s:7, so:3, o:"You wrote it the way Brad would — except true. Turns out advocating for yourself is just Brad’s whole strategy, minus the lying."},
+        {t:"A 4, and quietly cc the wins to your own inbox.", s:3, so:4, o:"Confident, not delusional, with a paper trail for the next place. This is the sweet spot and you know it."}
+      ]
+    },
+    {
+      tag:"4:57 · The Closer", clock:"4:57",
+      title:"“Super Quick Thing Before You Go”",
+      scene:"Bag on your shoulder. One foot out the door. Slack: “super quick thing — should take 5 min.” It is 4:57. It is never five minutes.",
+      choices:[
+        {t:"Drop the bag. “Sure, what’s up?”", s:6, so:-11, o:"Fifty minutes. It was fifty minutes. You got home late having learned only that “quick” is a lie with a calendar."},
+        {t:"“Heading out — first thing tomorrow?”", s:-3, so:12, o:"“np!” It waited until tomorrow with zero consequences, proving it always could have. You kept the boundary and the evening."},
+        {t:"“Drop it in a message and I’ll knock it out at 9.”", s:1, so:5, o:"You converted an ambush into a ticket — documented, scoped, and not eating your night. The 4:57 special, defused."}
+      ]
+    }
+  ];
+
+  const clamp = (v) => Math.max(0, Math.min(100, v));
+  const fmt = (n) => '$' + String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+  // ---- The career ------------------------------------------------------------
+  const LADDER = [
+    { title:'Intern',    pay:180 },
+    { title:'Associate', pay:300 },
+    { title:'Senior',    pay:450 },
+    { title:'Manager',   pay:620 },
+    { title:'Director',  pay:800 }
+  ];
+  const FU_TARGET      = 6000;  // your number: bank this and you can walk out (the win)
+  const DAY_ENCOUNTERS = 2;     // cards are spice now; the real-time office is the game
+  const BURN_BASE      = 130;   // daily cost of living, week 1
+  const BURN_STEP      = 25;    // lifestyle creep: burn rises this much per week
+  const PROMOTE_AT     = 68;    // standing needed at the Friday review
+  const PROMOTE_RESET  = 55;    // "the bar moves": standing after a promotion
+  const PROMOTE_SOUL   = 5;     // what each rung costs you
+  const WARN_AT        = 35;    // below this at review = formal warning
+  const WARN_SOUL      = 4;     // the dread
+  const BROKE_SOUL     = 6;     // overdraft anxiety when pay can't cover the burn
+
+  const burnFor      = (week) => BURN_BASE + BURN_STEP * (week - 1);
+  const soulDrainFor = (week) => week >= 5 ? 3 : week >= 3 ? 2 : 1; // the grind compounds
+
+  // Deterministic PRNG (mulberry32 stepped on g.rngState). Same seed = same career.
+  function rand(g){
+    g.rngState = (g.rngState + 0x6D2B79F5) | 0;
+    let t = Math.imul(g.rngState ^ (g.rngState >>> 15), 1 | g.rngState);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+
+  // Sample DAY_ENCOUNTERS distinct encounters for the day, replayed in clock order.
+  function planDay(g){
+    const pool = ENCOUNTERS.map((_, i) => i);
+    for(let i = pool.length - 1; i > 0; i--){
+      const j = Math.floor(rand(g) * (i + 1));
+      const tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+    }
+    return pool.slice(0, DAY_ENCOUNTERS).sort((a, b) => a - b);
+  }
+
+  // Fresh career. Day 1, Intern, seeded plan for the first day.
+  function newGame(seed){
+    const g = {
+      standing: START.standing, soul: START.soul, money: START.money,
+      day: 1, week: 1, jobIdx: 0,
+      idxInDay: 0, plan: null,
+      failed: null, escaped: false, over: false,
+      lastChoice: null, dayReport: null,
+      rngState: (seed == null ? 1 : seed) | 0
+    };
+    g.plan = planDay(g);
+    return g;
+  }
+
+  function currentEncounter(g){ return ENCOUNTERS[g.plan[g.idxInDay]]; }
+  function isFinalEncounter(g){ return g.idxInDay >= g.plan.length - 1; }
+  function jobTitle(g){ return LADDER[g.jobIdx].title; }
+
+  // Apply a choice to the meters. Returns the deltas + outcome + any fail state so the
+  // shell can render feedback without touching the rules. Does NOT advance the clock.
+  function applyChoice(g, choiceIndex){
+    const enc = currentEncounter(g);
+    const c = enc.choices[choiceIndex];
+    if(!c) return null;
+    const before = { standing: g.standing, soul: g.soul };
+    g.standing = clamp(g.standing + c.s);
+    g.soul     = clamp(g.soul + c.so);
+    // fail states: either meter bottoming out ends the day early
+    if(g.standing <= 0){ g.failed = 'standing'; g.over = true; }
+    else if(g.soul <= 0){ g.failed = 'soul'; g.over = true; }
+    g.lastChoice = {
+      choiceIndex,
+      ds: g.standing - before.standing,
+      dso: g.soul - before.soul,
+      outcome: c.o
+    };
+    return g.lastChoice;
+  }
+
+  // A soul cost outside a choice (drain, promotion, warning, overdraft). Can end the run.
+  function soulHit(g, n){
+    g.soul = clamp(g.soul - n);
+    if(g.soul <= 0 && !g.failed){ g.failed = 'soul'; g.over = true; }
+  }
+
+  // ---- The world's verbs: everything you DO on the floor lands here -----------
+  // The office (ntos-world.js) signals these; the shell applies them. One table so
+  // the whole real-time economy is visible, testable, and tunable in one place.
+  const WORLD_EFFECTS = {
+    taskDone:   { s:+2, so:-1 },   // shipped work: the org notices, the grind takes
+    bossPass:   { s:+2, so: 0 },   // he walked by; you were at your desk
+    bossCatch:  { s:-6, so:-1 },   // he walked by an empty chair
+    bossCatchBad:{ s:-9, so:-2 },  // ...on one of his bad days
+    bradSteal:  { s:-3, so:-2 },   // your work is his work now
+    bradFoiled: { s:+1, so:+1 },   // he hovered; you were sitting right there
+    chatGood:   { s: 0, so:+5 },   // five minutes of being human
+    chatMeh:    { s: 0, so:+3 },
+    chatBad:    { s: 0, so:+2 },   // you listened to them vent; still counts
+    couch:      { s:-1, so:+6 },   // seen lounging; worth it
+    coffee:     { s: 0, so:+2 }
+  };
+  function applyWorldEffect(g, kind){
+    const e = WORLD_EFFECTS[kind];
+    if(!e) return null;
+    const b = { s: g.standing, so: g.soul };
+    g.standing = clamp(g.standing + (e.s || 0));
+    g.soul     = clamp(g.soul + (e.so || 0));
+    if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
+    else if(g.soul <= 0 && !g.failed){ g.failed = 'soul'; g.over = true; }
+    return { kind, ds: g.standing - b.s, dso: g.soul - b.so };
+  }
+
+  // Advance past a resolved card. Cards no longer end the day — 5 PM does.
+  // Returns 'gameover' | 'ok'.
+  const DECAY_S     = 6;   // "what have you done for them lately" — daily standing decay
+  const TASK_MISS_S = 1;   // per task left in the inbox at 5 PM
+  function advance(g){
+    if(g.failed){ g.over = true; return 'gameover'; }
+    g.idxInDay++;
+    return 'ok';
+  }
+
+  // Close out the day at 5 PM: unfinished work + decay, payday, cost of living,
+  // the grind, and (Fridays) the review. stats come from the world's day.
+  // Returns 'gameover' | 'dayend'; builds g.dayReport for the 5:01 screen.
+  function closeDay(g, stats){
+    stats = stats || { tasksDone: 0, tasksTotal: 0 };
+    if(g.failed){ g.over = true; return 'gameover'; }
+    const pay = LADDER[g.jobIdx].pay;
+    const burn = burnFor(g.week);
+    const drain = soulDrainFor(g.week);
+    const missed = Math.max(0, stats.tasksTotal - stats.tasksDone);
+    const report = { day: g.day, week: g.week, title: jobTitle(g), pay, burn, drain,
+                     tasksDone: stats.tasksDone, tasksTotal: stats.tasksTotal,
+                     missed, decay: DECAY_S,
+                     broke: false, promoted: false, warned: false, newTitle: null };
+    // the treadmill: yesterday's hero + whatever died in the inbox
+    g.standing = clamp(g.standing - DECAY_S - missed * TASK_MISS_S);
+    if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
+    g.money += pay - burn;
+    if(g.money < 0){ g.money = 0; report.broke = true; if(!g.failed) soulHit(g, BROKE_SOUL); }
+    if(!g.failed) soulHit(g, drain);
+    if(!g.failed && g.day % 5 === 0){ // Friday review
+      if(g.standing >= PROMOTE_AT && g.jobIdx < LADDER.length - 1){
+        g.jobIdx++; g.standing = PROMOTE_RESET; soulHit(g, PROMOTE_SOUL);
+        report.promoted = true; report.newTitle = jobTitle(g);
+      } else if(g.standing < WARN_AT){
+        soulHit(g, WARN_SOUL); report.warned = true;
+      }
+    }
+    report.money = g.money;
+    g.dayReport = report;
+    return g.failed ? 'gameover' : 'dayend';
+  }
+
+  // The morning after a survived day: new date, fresh plan.
+  function nextDay(g){
+    g.day++; g.week = Math.floor((g.day - 1) / 5) + 1;
+    g.idxInDay = 0; g.plan = planDay(g); g.dayReport = null;
+  }
+
+  // Fire drill (a crunch, not a fire): deliver under a timer or eat a Standing hit.
+  const CRUNCH_WIN = 4, CRUNCH_LOSE = 10;
+  function applyCrunch(g, success){
+    const before = g.standing;
+    g.standing = clamp(g.standing + (success ? CRUNCH_WIN : -CRUNCH_LOSE));
+    if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
+    return { ds: g.standing - before, success };
+  }
+
+  // The coffee machine: one small mercy per day.
+  const COFFEE_SOUL = 2;
+  function applyCoffee(g){
+    if(g.coffeeDay === g.day) return null;
+    g.coffeeDay = g.day;
+    const before = g.soul;
+    g.soul = clamp(g.soul + COFFEE_SOUL);
+    return { dso: g.soul - before };
+  }
+
+  // The win condition: your number, banked. Walking out ends the run as an escape.
+  function canWalkOut(g){ return !g.over && g.money >= FU_TARGET; }
+  function walkOut(g){
+    if(!canWalkOut(g)) return false;
+    g.escaped = true; g.over = true; return true;
+  }
+
+  // The ending. Driven by how the run actually ended: escape, fired, or hollowed out.
+  function verdict(g){
+    const days = g.day, bank = fmt(g.money);
+    if(g.escaped && g.soul >= 50) return {
+      tag:'Day '+days+' · You quit', tone:'ok', title:'F-You Money. Out the Door. Whole.',
+      body:'You hit your number with your soul still breathing, set the badge on the desk, and walked. '+bank+' banked in '+days+' days, zero regrets. The sync will be held without you, forever. This is the win.'
+    };
+    if(g.escaped) return {
+      tag:'Day '+days+' · You quit', tone:'soul', title:'Out. Technically.',
+      body:'You hit your number and escaped — but the building kept a piece of you at every rung. '+bank+' in '+days+' days, paid at full retail. Spend some of it remembering who you were.'
+    };
+    if(g.failed === 'standing') return {
+      tag:'Day '+days+' · Terminated', tone:'danger', title:'Managed Out',
+      body:'Security walked you to your car with '+bank+' saved — not your number, but yours. You kept your dignity; the org kept the ficus. On the bright side: you never have to attend the sync again.'
+    };
+    if(g.failed === 'soul') return {
+      tag:'Day '+days+' · Congratulations (?)', tone:'danger', title:'Promoted to Middle Management',
+      body:'You schedule the syncs now. You send the 4:57 asks. You say “let’s take this offline.” The '+bank+' you saved will buy things the new you enjoys. This is the real game over.'
+    };
+    return {
+      tag:'Day '+days, tone:'muted', title:'Still There.',
+      body:'The day ended. Another one is coming. '+bank+' banked against a number of '+fmt(FU_TARGET)+'. Keep going.'
+    };
+  }
+
+  return {
+    START, ENCOUNTERS, LADDER,
+    FU_TARGET, DAY_ENCOUNTERS, BURN_BASE, BURN_STEP,
+    PROMOTE_AT, PROMOTE_RESET, PROMOTE_SOUL, WARN_AT, WARN_SOUL, BROKE_SOUL,
+    CRUNCH_WIN, CRUNCH_LOSE, COFFEE_SOUL, DECAY_S, TASK_MISS_S, WORLD_EFFECTS,
+    clamp, fmt, burnFor, soulDrainFor,
+    newGame, planDay, currentEncounter, isFinalEncounter, jobTitle,
+    applyChoice, advance, closeDay, nextDay, canWalkOut, walkOut, verdict,
+    applyCrunch, applyCoffee, applyWorldEffect
+  };
+})();
+
+// browser + headless-test exposure (no-op if neither exists)
+if (typeof window !== 'undefined') window.NineToSurvive = NineToSurvive;
+if (typeof module !== 'undefined' && module.exports) module.exports = NineToSurvive;
+</script>
+<script>
+/* ntos-world.js — Nine to Survive: the OFFICE (real-time isometric world)
+ *
+ * This is the game now, RCT-style: you drive your bear directly (click-to-move),
+ * work is physical (tasks pile in your inbox; you grind them AT your desk), and
+ * threats cross the floor in real time — the Boss walks by (be at your desk),
+ * Brad raids your inbox (be sitting there), fire drills hit. Soul recovery is
+ * spatial too: coffee, the couch, walking over to chat with a coworker. The
+ * encounter cards still exist but are rare spice: their owner NPC walks to your
+ * desk at the card's clock time.
+ *
+ * Career RULES stay in ntos-game.js; this module never touches meters. It emits
+ * signals from step(w, dt) — {type:'taskdone'|'bosspass'|'bosscatch'|'bradsteal'|
+ * 'bradfoiled'|'chat'|'couch'|'coffee'|'task'|'bosswalk'|'encounter'|'crunch'|
+ * 'dayover'} — and the shell applies them via NineToSurvive.applyWorldEffect.
+ *
+ * Headless-safe like marque-world.js: pure logic over a plain world object,
+ * step() decoupled from rAF, deterministic via mulberry32 on w.rngState.
+ * render()/screenToTile() are the only canvas code.
+ */
+const NtosWorld = (() => {
+'use strict';
+
+// ── grid + projection ─────────────────────────────────────────────────────────
+const GRID_W = 40, GRID_H = 26;   // a floor bigger than the screen — panning matters
+const TW = 64, TH = 32;           // iso tile size at zoom 1
+const WALK_SPEED = 3.2;           // tiles/sec (summoned NPCs + your errands hustle ×1.9)
+const CLOCK_SPEED = 2.2;          // game-minutes per real second → a day ≈ 3.6 real min
+const TASK_WORK_SECS = 11;        // real seconds at your desk to ship one task
+const TASKS_PER_DAY = 8;
+const CRUNCH_CHANCE = 0.45;       // odds a day contains a fire drill
+const BOSS_WALKS_PER_DAY = 2;
+
+// ── furniture: rects of blocked tiles (w×d), drawn as iso boxes ───────────────
+const FURNITURE = [
+  { id:'desk-you',    label:'YOUR DESK', x:8,  y:15, w:2, d:1, h:0.55, color:'#8a6f4d' },
+  { id:'desk-brad',   label:null,        x:13, y:15, w:2, d:1, h:0.55, color:'#7d858f' },
+  { id:'desk-kayla',  label:null,        x:8,  y:19, w:2, d:1, h:0.55, color:'#7d858f' },
+  { id:'desk-marcus', label:null,        x:13, y:19, w:2, d:1, h:0.55, color:'#7d858f' },
+  { id:'desk-priya',  label:null,        x:18, y:19, w:2, d:1, h:0.55, color:'#7d858f' },
+  { id:'desk-boss',   label:null,        x:33, y:4,  w:3, d:1, h:0.7,  color:'#4a4238' },
+  { id:'desk-hr',     label:null,        x:4,  y:4,  w:2, d:1, h:0.55, color:'#8f7d88' },
+  { id:'desk-dennis', label:null,        x:34, y:20, w:2, d:1, h:0.55, color:'#6f7a6f' },
+  { id:'coffee',      label:'COFFEE',    x:22, y:8,  w:1, d:1, h:0.8,  color:'#3d3a34' },
+  { id:'fridge',      label:null,        x:24, y:8,  w:1, d:1, h:1.0,  color:'#9aa1a8' },
+  { id:'table-meet',  label:null,        x:15, y:4,  w:4, d:2, h:0.5,  color:'#a08a5f' },
+  { id:'table-kitch', label:null,        x:22, y:11, w:2, d:2, h:0.5,  color:'#a08a5f' },
+  { id:'printer',     label:'PRINTER',   x:27, y:15, w:1, d:1, h:0.7,  color:'#5d6168' },
+  { id:'plant-1',     label:null,        x:11, y:11, w:1, d:1, h:0.9,  color:'#4e7a4e' },
+  { id:'plant-2',     label:null,        x:30, y:10, w:1, d:1, h:0.9,  color:'#4e7a4e' },
+  { id:'plant-3',     label:null,        x:2,  y:12, w:1, d:1, h:0.9,  color:'#4e7a4e' },
+  { id:'couch',       label:'COUCH',     x:2,  y:22, w:3, d:1, h:0.5,  color:'#b56a4f' }
+];
+const COFFEE_SPOT = { x:22, y:9 };
+const COUCH_SPOT  = { x:3,  y:21 };
+
+// ── zones: colored floor rugs with labels ─────────────────────────────────────
+const ZONES = [
+  { label:'THE BULLPEN',   x:6,  y:13, w:16, d:9,  color:'rgba(47,107,224,0.10)' },
+  { label:'CORNER OFFICE', x:31, y:2,  w:7,  d:6,  color:'rgba(21,18,13,0.14)'   },
+  { label:'HR',            x:2,  y:2,  w:6,  d:5,  color:'rgba(216,68,63,0.10)'  },
+  { label:'KITCHEN',       x:21, y:7,  w:6,  d:7,  color:'rgba(62,158,94,0.12)'  },
+  { label:'MEETING ROOM',  x:13, y:2,  w:8,  d:6,  color:'rgba(232,129,76,0.12)' },
+  { label:'THE PIPE',      x:32, y:18, w:6,  d:5,  color:'rgba(92,86,71,0.14)'   },
+  { label:'BREAK CORNER',  x:1,  y:20, w:6,  d:4,  color:'rgba(232,129,76,0.08)' }
+];
+
+// ── the cast ──────────────────────────────────────────────────────────────────
+const CAST = [
+  { id:'you',    name:'You',    role:'Trying to get out', color:'#8a5a2b', bear:true,
+    spot:{x:9, y:16} },
+  { id:'brad',   name:'Brad',   role:'Credit reallocation', color:'#2F6BE0',
+    spot:{x:14, y:16},
+    lines:{ good:'Just circled back on something that was yours.',
+            meh:'Polishing a deck. The data looks familiar.',
+            bad:'His “win” got questioned. Volatile.' } },
+  { id:'dennis', name:'Dennis', role:'Senior approval-holder, 19 years', color:'#5C7A5C',
+    spot:{x:35, y:21},
+    lines:{ good:'Only has FOUR questions today. A gift.',
+            meh:'Reviewing. Do not ask about the timeline.',
+            bad:'Someone went around him once in 2019. He remembers.' } },
+  { id:'boss',   name:'The Boss', role:'Ambush scheduler', color:'#15120D',
+    spot:{x:34, y:5},
+    lines:{ good:'Had a good call. Approachable for ~an hour.',
+            meh:'Neutral. Could go either way. Tread evenly.',
+            bad:'BAD DAY. Do not be away from your desk when he walks.' } },
+  { id:'hr',     name:'Meredith (HR)', role:'People & Culture™', color:'#B0568C',
+    spot:{x:5, y:5},
+    lines:{ good:'Planning mandatory fun. You are on a list.',
+            meh:'Updating the handbook. Section: you.',
+            bad:'Scheduling “quick chats.” Decline nothing.' } },
+  { id:'kayla',  name:'Kayla',  role:'Also trying to get out', color:'#3E9E9E', chat:true,
+    spot:{x:9, y:20},
+    lines:{ good:'Got an interview elsewhere. Glowing quietly.',
+            meh:'Headphones on. The universal do-not-disturb.',
+            bad:'Her project got “deprioritized.” Again.' } },
+  { id:'marcus', name:'Marcus', role:'Has seen everything', color:'#C1652F', chat:true,
+    spot:{x:14, y:20},
+    lines:{ good:'Coasting beautifully. A master class.',
+            meh:'Third coffee. Counting down to 5.',
+            bad:'Got voluntold for the weekend thing.' } },
+  { id:'priya',  name:'Priya',  role:'Actually does the work', color:'#7C6FD6', chat:true,
+    spot:{x:19, y:20},
+    lines:{ good:'Shipped early. Nobody noticed. She noticed.',
+            meh:'In four meetings that could be emails.',
+            bad:'Brad presented her numbers this morning.' } }
+];
+
+// Which NPC owns each encounter in the pool (by ENCOUNTERS index).
+const OWNER_BY_ENC = { 0:'boss', 1:'brad', 2:'boss', 3:'hr', 4:'brad',
+                       5:'hr', 6:'dennis', 7:'boss', 8:'hr', 9:'boss' };
+
+const MOODS = ['good','meh','bad'];
+const MOOD_FACE = { good:'😊', meh:'😐', bad:'😤' };
+
+// ── deterministic rng ─────────────────────────────────────────────────────────
+function rand(w){
+  w.rngState = (w.rngState + 0x6D2B79F5) | 0;
+  let t = Math.imul(w.rngState ^ (w.rngState >>> 15), 1 | w.rngState);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+function clockToMin(c){
+  const h = parseInt(c, 10), m = parseInt(c.split(':')[1], 10);
+  return (h < 9 ? h + 12 : h) * 60 + m;   // 9..11 am, 12, then 1..5 pm
+}
+function minToClock(min){
+  let h = Math.floor(min / 60), m = min % 60;
+  const am = h < 12;
+  if(h > 12) h -= 12;
+  return h + ':' + (m < 10 ? '0' : '') + m + (am ? ' AM' : ' PM');
+}
+
+// ── walkability + BFS pathing ─────────────────────────────────────────────────
+function buildWalkGrid(){
+  const walk = new Array(GRID_W * GRID_H).fill(true);
+  FURNITURE.forEach(f => {
+    for(let dx = 0; dx < f.w; dx++) for(let dy = 0; dy < f.d; dy++)
+      walk[(f.y + dy) * GRID_W + (f.x + dx)] = false;
+  });
+  return walk;
+}
+const isWalkable = (w, x, y) =>
+  x >= 0 && y >= 0 && x < GRID_W && y < GRID_H && w.walk[y * GRID_W + x];
+
+function bfsPath(w, from, to){
+  const sx = Math.round(from.x), sy = Math.round(from.y);
+  const tx = Math.round(to.x),  ty = Math.round(to.y);
+  if(!isWalkable(w, tx, ty)) return null;
+  if(sx === tx && sy === ty) return [];
+  const prev = new Int32Array(GRID_W * GRID_H).fill(-1);
+  const q = [sy * GRID_W + sx];
+  prev[q[0]] = q[0];
+  const goal = ty * GRID_W + tx;
+  for(let qi = 0; qi < q.length; qi++){
+    const cur = q[qi];
+    if(cur === goal) break;
+    const cx = cur % GRID_W, cy = (cur / GRID_W) | 0;
+    const nb = [[cx+1,cy],[cx-1,cy],[cx,cy+1],[cx,cy-1]];
+    for(const [nx, ny] of nb){
+      if(!isWalkable(w, nx, ny)) continue;
+      const ni = ny * GRID_W + nx;
+      if(prev[ni] !== -1) continue;
+      prev[ni] = cur; q.push(ni);
+    }
+  }
+  if(prev[goal] === -1) return null;
+  const path = [];
+  for(let cur = goal; cur !== prev[cur]; cur = prev[cur])
+    path.push({ x: cur % GRID_W, y: (cur / GRID_W) | 0 });
+  return path.reverse();
+}
+
+function adjacentTo(w, actor){
+  const ax = Math.round(actor.x), ay = Math.round(actor.y);
+  const opts = [[ax-1,ay],[ax+1,ay],[ax,ay-1],[ax,ay+1]];
+  for(const [x, y] of opts) if(isWalkable(w, x, y)) return { x, y };
+  return { x: ax, y: ay };
+}
+
+// ── world construction ────────────────────────────────────────────────────────
+// plan = the day's encounter indices from NineToSurvive (already clock-ordered).
+function newDay(seed, day, plan){
+  const w = {
+    day,
+    rngState: ((seed | 0) ^ Math.imul(day, 2654435761)) | 0,
+    walk: buildWalkGrid(),
+    actors: CAST.map(c => ({
+      id: c.id, name: c.name, role: c.role, color: c.color, bear: !!c.bear,
+      chat: !!c.chat,
+      x: c.spot.x, y: c.spot.y, home: { x: c.spot.x, y: c.spot.y },
+      path: [], state: 'idle', wanderT: 0,   // re-seeded below via rand(w)
+      mood: 'meh', lines: c.lines || null
+    })),
+    clockMin: 540,           // 9:00 AM
+    running: true,
+    sig: [],                 // signal queue → shell drains via step()'s return
+    // cards (rare spice): owner walks over at the card's clock time
+    events: plan.map(encIdx => ({
+      encIdx, owner: OWNER_BY_ENC[encIdx],
+      atMin: clockToMin(_encounters[encIdx].clock),
+      status: 'pending'      // pending → walking → active → done
+    })),
+    nextEvent: 0,
+    activeEvent: null,
+    // the actual work: tasks land in your inbox through the day
+    tasks: { pending: 0, done: 0, spawned: 0, total: TASKS_PER_DAY, progress: 0,
+             spawnAt: [] },
+    // threats
+    bossWalks: [],           // [{atMin, status:'pending'|'out'|'done'}]
+    bradRaids: [],
+    crunch: null,            // {atMin, status}
+    // recovery economy (once a day each)
+    coffeeUsed: false, couchUsed: false, chatted: {},
+    playerErrand: null,      // {type:'coffee'|'couch'|'chat', id?, repaths}
+    moveMarker: null,
+    dayOver: false
+  };
+  // seed wander timers + daily moods deterministically
+  w.actors.forEach(a => {
+    a.wanderT = 2 + rand(w) * 6;
+    if(a.id !== 'you') a.mood = MOODS[Math.floor(rand(w) * 3)];
+  });
+  // task drip: 3 waiting at 9:00, then one every ~55 game-min
+  w.tasks.spawnAt = [540, 540, 540];
+  for(let i = 3; i < TASKS_PER_DAY; i++) w.tasks.spawnAt.push(595 + (i - 3) * 55);
+  // boss floor-walks: two, spaced through the day
+  for(let i = 0; i < BOSS_WALKS_PER_DAY; i++)
+    w.bossWalks.push({ atMin: 620 + i * 170 + Math.floor(rand(w) * 60), status: 'pending' });
+  // brad raids: one or two
+  const raids = 1 + (rand(w) < 0.5 ? 1 : 0);
+  for(let i = 0; i < raids; i++)
+    w.bradRaids.push({ atMin: 600 + Math.floor(rand(w) * 360), status: 'pending' });
+  w.bradRaids.sort((a, b) => a.atMin - b.atMin);
+  // maybe a fire drill
+  if(rand(w) < CRUNCH_CHANCE)
+    w.crunch = { atMin: 690 + Math.floor(rand(w) * 120), status: 'pending' };
+  return w;
+}
+
+// world needs encounter clocks; injected once by the shell (or tests).
+let _encounters = null;
+function setEncounters(list){ _encounters = list; }
+
+// ── behavior ──────────────────────────────────────────────────────────────────
+function sendTo(w, actor, tile, state){
+  const p = bfsPath(w, actor, tile);
+  if(p === null) return false;
+  actor.path = p; actor.state = state || 'walking';
+  return true;
+}
+
+function moveAlongPath(a, dt){
+  const speed = (a.state === 'summoned' || a.state === 'errand' || a.state === 'raid'
+                 || a.state === 'patrol') ? WALK_SPEED * 1.9 : WALK_SPEED;
+  let budget = speed * dt;
+  while(budget > 0 && a.path.length){
+    const t = a.path[0];
+    const dx = t.x - a.x, dy = t.y - a.y;
+    const dist = Math.hypot(dx, dy);
+    if(dist <= budget){ a.x = t.x; a.y = t.y; a.path.shift(); budget -= dist; }
+    else { a.x += dx / dist * budget; a.y += dy / dist * budget; budget = 0; }
+  }
+  return a.path.length === 0;
+}
+
+function getActor(w, id){ return w.actors.find(a => a.id === id); }
+function playerAtDesk(w){
+  const you = getActor(w, 'you');
+  return Math.hypot(you.x - you.home.x, you.y - you.home.y) < 0.8;
+}
+
+// One tick. Drains one signal per call (queue keeps the rest for the next frame).
+function step(w, dt){
+  if(!w.running) return w.sig.shift() || null;
+  const you = getActor(w, 'you');
+
+  w.clockMin = Math.min(1020, w.clockMin + CLOCK_SPEED * dt);
+
+  // ---- task drip + working at your desk ----
+  while(w.tasks.spawned < w.tasks.total && w.clockMin >= w.tasks.spawnAt[w.tasks.spawned]){
+    w.tasks.spawned++; w.tasks.pending++;
+    w.sig.push({ type:'task', pending: w.tasks.pending });
+  }
+  if(w.tasks.pending > 0 && playerAtDesk(w) && !you.path.length){
+    w.tasks.progress += dt / TASK_WORK_SECS;
+    if(w.tasks.progress >= 1){
+      w.tasks.progress = 0; w.tasks.pending--; w.tasks.done++;
+      w.sig.push({ type:'taskdone', done: w.tasks.done, pending: w.tasks.pending });
+    }
+  }
+
+  // ---- movement + wander ----
+  w.actors.forEach(a => {
+    if(a.path.length){
+      const arrived = moveAlongPath(a, dt);
+      if(!arrived) return;
+      if(a.id === 'you') w.moveMarker = null;
+      if(a.state === 'summoned'){ a.state = 'atPlayer'; }
+      else if(a.state === 'errand' && a.id === 'you'){ a.state = 'idle'; arriveErrand(w, you); }
+      else if(a.state === 'patrol' && a.id === 'boss'){ bossArrives(w, a, you); }
+      else if(a.state === 'raid' && a.id === 'brad'){ bradArrives(w, a, you); }
+      else { a.state = 'idle'; }
+      return;
+    }
+    if(a.state !== 'idle' || a.id === 'you') return;
+    a.wanderT -= dt;
+    if(a.wanderT <= 0){
+      a.wanderT = 3 + rand(w) * 8;
+      const r = rand(w);
+      if(r < 0.30){
+        const tx = a.home.x + Math.floor(rand(w) * 7) - 3;
+        const ty = a.home.y + Math.floor(rand(w) * 7) - 3;
+        if(isWalkable(w, tx, ty)) sendTo(w, a, { x: tx, y: ty }, 'walking');
+      } else if(r < 0.42){
+        sendTo(w, a, COFFEE_SPOT, 'walking');
+      } else if(Math.abs(a.x - a.home.x) + Math.abs(a.y - a.home.y) > 0.6){
+        sendTo(w, a, a.home, 'returning');
+      }
+    }
+  });
+
+  // ---- fire drill ----
+  if(w.crunch && w.crunch.status === 'pending' && w.clockMin >= w.crunch.atMin){
+    w.crunch.status = 'active';
+    w.running = false;
+    w.sig.push({ type:'crunch' });
+    return w.sig.shift();
+  }
+
+  // ---- boss floor-walk ----
+  const boss = getActor(w, 'boss');
+  w.bossWalks.forEach(bw => {
+    if(bw.status === 'pending' && w.clockMin >= bw.atMin && boss.state === 'idle'){
+      bw.status = 'out';
+      sendTo(w, boss, adjacentTo(w, { x: you.home.x, y: you.home.y }), 'patrol');
+      w.sig.push({ type:'bosswalk', mood: boss.mood });
+    }
+  });
+
+  // ---- brad raid ----
+  const brad = getActor(w, 'brad');
+  w.bradRaids.forEach(br => {
+    if(br.status === 'pending' && w.clockMin >= br.atMin && brad.state === 'idle'){
+      br.status = 'out';
+      sendTo(w, brad, adjacentTo(w, { x: you.home.x, y: you.home.y }), 'raid');
+    }
+  });
+
+  // ---- the day's cards (owner walks over at the card's minute) ----
+  if(w.nextEvent < w.events.length){
+    const ev = w.events[w.nextEvent];
+    if(ev.status === 'pending' && w.clockMin >= ev.atMin){
+      const owner = getActor(w, ev.owner);
+      if(owner.state === 'idle' || owner.state === 'walking' || owner.state === 'returning'){
+        ev.status = 'walking';
+        owner.path = [];
+        sendTo(w, owner, adjacentTo(w, you), 'summoned');
+      }
+    }
+    if(ev.status === 'walking'){
+      const owner = getActor(w, ev.owner);
+      if(owner.state === 'atPlayer'){
+        ev.status = 'active';
+        w.activeEvent = ev;
+        w.running = false;
+        w.sig.push({ type:'encounter', event: ev });
+      }
+    }
+  }
+
+  // ---- 5 PM ----
+  if(!w.dayOver && w.clockMin >= 1020 && w.nextEvent >= w.events.length && !w.activeEvent){
+    w.dayOver = true;
+    w.sig.push({ type:'dayover', tasksDone: w.tasks.done, tasksTotal: w.tasks.total });
+  }
+
+  return w.sig.shift() || null;
+}
+
+// errand arrivals (you reached the thing you clicked)
+function arriveErrand(w, you){
+  const e = w.playerErrand;
+  if(!e) return;
+  if(e.type === 'coffee'){
+    w.playerErrand = null;
+    w.sig.push({ type:'coffee' });
+  } else if(e.type === 'couch'){
+    w.playerErrand = null;
+    w.sig.push({ type:'couch' });
+  } else if(e.type === 'chat'){
+    const target = getActor(w, e.id);
+    if(Math.hypot(target.x - you.x, target.y - you.y) <= 2.2){
+      w.playerErrand = null; w.chatted[e.id] = true;
+      w.sig.push({ type:'chat', who: e.id, name: target.name, mood: target.mood });
+    } else if(e.repaths < 3){
+      e.repaths++;
+      sendTo(w, you, adjacentTo(w, target), 'errand');
+    } else {
+      w.playerErrand = null;   // they got away; no harm
+    }
+  }
+}
+
+function bossArrives(w, boss, you){
+  const walk = w.bossWalks.find(b => b.status === 'out');
+  if(walk) walk.status = 'done';
+  const atDesk = playerAtDesk(w);
+  w.sig.push(atDesk
+    ? { type:'bosspass' }
+    : { type:'bosscatch', bad: boss.mood === 'bad' });
+  sendTo(w, boss, boss.home, 'returning');
+}
+
+function bradArrives(w, brad, you){
+  const raid = w.bradRaids.find(b => b.status === 'out');
+  if(raid) raid.status = 'done';
+  if(!playerAtDesk(w) && w.tasks.pending > 0){
+    // he lifts the file you were furthest through
+    w.tasks.pending--;
+    w.tasks.progress = 0;
+    w.sig.push({ type:'bradsteal', pending: w.tasks.pending });
+  } else {
+    w.sig.push({ type:'bradfoiled' });
+  }
+  sendTo(w, brad, brad.home, 'returning');
+}
+
+// Card resolved: the owner goes home, the day resumes.
+function resolveEncounter(w){
+  if(!w.activeEvent) return;
+  const owner = getActor(w, w.activeEvent.owner);
+  sendTo(w, owner, owner.home, 'returning');
+  w.activeEvent.status = 'done';
+  w.activeEvent = null;
+  w.nextEvent++;
+  w.running = true;
+}
+
+function resolveCrunch(w){
+  if(w.crunch) w.crunch.status = 'done';
+  w.running = true;
+}
+
+function eventsRemaining(w){
+  return w.events.filter(e => e.status !== 'done').length;
+}
+
+// ── player verbs (all click-driven from the shell) ────────────────────────────
+function movePlayer(w, tile){
+  const you = getActor(w, 'you');
+  if(!isWalkable(w, Math.round(tile.x), Math.round(tile.y))) return false;
+  w.playerErrand = null;
+  if(!sendTo(w, you, { x: Math.round(tile.x), y: Math.round(tile.y) }, 'walking')) return false;
+  w.moveMarker = { x: Math.round(tile.x), y: Math.round(tile.y) };
+  return true;
+}
+function goForCoffee(w){
+  if(w.coffeeUsed) return false;
+  const you = getActor(w, 'you');
+  if(!sendTo(w, you, COFFEE_SPOT, 'errand')) return false;
+  w.coffeeUsed = true; w.playerErrand = { type:'coffee', repaths: 0 };
+  w.moveMarker = COFFEE_SPOT;
+  return true;
+}
+function goForCouch(w){
+  if(w.couchUsed) return false;
+  const you = getActor(w, 'you');
+  if(!sendTo(w, you, COUCH_SPOT, 'errand')) return false;
+  w.couchUsed = true; w.playerErrand = { type:'couch', repaths: 0 };
+  w.moveMarker = COUCH_SPOT;
+  return true;
+}
+function requestChat(w, id){
+  const target = getActor(w, id);
+  if(!target || !target.chat || w.chatted[id]) return false;
+  const you = getActor(w, 'you');
+  if(!sendTo(w, you, adjacentTo(w, target), 'errand')) return false;
+  w.playerErrand = { type:'chat', id, repaths: 0 };
+  w.moveMarker = null;
+  return true;
+}
+function playerGoHome(w){
+  const you = getActor(w, 'you');
+  w.playerErrand = null;
+  sendTo(w, you, you.home, 'walking');
+  w.moveMarker = { x: you.home.x, y: you.home.y };
+}
+
+// ── picking + status ──────────────────────────────────────────────────────────
+function pickActorAt(w, gx, gy){
+  let best = null, bestD = 0.75;
+  w.actors.forEach(a => {
+    const d = Math.hypot(a.x - gx, a.y - gy);
+    if(d < bestD){ best = a; bestD = d; }
+  });
+  return best;
+}
+function furnitureAt(gx, gy){
+  const x = Math.round(gx), y = Math.round(gy);
+  return FURNITURE.find(f => x >= f.x - 1 && x <= f.x + f.w && y >= f.y - 1 && y <= f.y + f.d) || null;
+}
+function isCoffeeAt(gx, gy){
+  const f = furnitureAt(gx, gy);
+  return !!f && (f.id === 'coffee' || f.id === 'fridge');
+}
+function isCouchAt(gx, gy){
+  const f = furnitureAt(gx, gy);
+  return !!f && f.id === 'couch';
+}
+function statusOf(w, actor){
+  if(actor.id === 'you') return { name:'You', role: actor.role, mood: null,
+    line:'Tasks ship at your desk. Soul refills everywhere else. Choose.', face:'🐻', chat:false };
+  return {
+    name: actor.name, role: actor.role, mood: actor.mood,
+    face: MOOD_FACE[actor.mood],
+    line: actor.lines ? actor.lines[actor.mood] : '',
+    chat: !!actor.chat && !w.chatted[actor.id]
+  };
+}
+
+// ── rendering (the only DOM-adjacent code; tests never call it) ───────────────
+function proj(cam, gx, gy){
+  return [ (gx - gy) * (TW / 2) * cam.z + cam.x,
+           (gx + gy) * (TH / 2) * cam.z + cam.y ];
+}
+function screenToTile(cam, sx, sy){
+  const ix = (sx - cam.x) / ((TW / 2) * cam.z);
+  const iy = (sy - cam.y) / ((TH / 2) * cam.z);
+  return { x: (ix + iy) / 2, y: (iy - ix) / 2 };
+}
+
+function render(w, ctx, cam, vw, vh){
+  ctx.clearRect(0, 0, vw, vh);
+  const z = cam.z;
+
+  for(let y = 0; y < GRID_H; y++){
+    for(let x = 0; x < GRID_W; x++){
+      const [px, py] = proj(cam, x, y);
+      if(px < -TW * z || px > vw + TW * z || py < -TH * z || py > vh + TH * z) continue;
+      ctx.beginPath();
+      ctx.moveTo(px, py - (TH / 2) * z);
+      ctx.lineTo(px + (TW / 2) * z, py);
+      ctx.lineTo(px, py + (TH / 2) * z);
+      ctx.lineTo(px - (TW / 2) * z, py);
+      ctx.closePath();
+      ctx.fillStyle = (x + y) % 2 ? '#EDE5CF' : '#E7DEC6';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(21,18,13,0.05)'; ctx.lineWidth = 1; ctx.stroke();
+    }
+  }
+  ZONES.forEach(zn => {
+    ctx.beginPath();
+    const c = [[zn.x, zn.y],[zn.x + zn.w, zn.y],[zn.x + zn.w, zn.y + zn.d],[zn.x, zn.y + zn.d]];
+    c.forEach(([gx, gy], i) => {
+      const [px, py] = proj(cam, gx - 0.5, gy - 0.5);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.closePath(); ctx.fillStyle = zn.color; ctx.fill();
+    const [lx, ly] = proj(cam, zn.x + zn.w / 2 - 0.5, zn.y + zn.d / 2 - 0.5);
+    ctx.fillStyle = 'rgba(21,18,13,0.34)';
+    ctx.font = '700 ' + Math.max(9, 11 * z) + 'px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(zn.label, lx, ly);
+  });
+
+  // click-to-move marker
+  if(w.moveMarker){
+    const [mx, my] = proj(cam, w.moveMarker.x, w.moveMarker.y);
+    ctx.beginPath();
+    ctx.moveTo(mx, my - (TH / 2) * z * 0.7);
+    ctx.lineTo(mx + (TW / 2) * z * 0.7, my);
+    ctx.lineTo(mx, my + (TH / 2) * z * 0.7);
+    ctx.lineTo(mx - (TW / 2) * z * 0.7, my);
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(47,107,224,0.9)'; ctx.lineWidth = 2 * z; ctx.stroke();
+  }
+
+  const drawables = [];
+  FURNITURE.forEach(f => drawables.push({ d: f.x + f.w / 2 + f.y + f.d / 2, f }));
+  w.actors.forEach(a => drawables.push({ d: a.x + a.y + 0.01, a }));
+  drawables.sort((p, q) => p.d - q.d);
+  drawables.forEach(item => {
+    if(item.f) drawBox(ctx, cam, item.f, w);
+    else drawActor(ctx, cam, item.a, w);
+  });
+}
+
+function shade(hex, f){
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.min(255, ((n >> 16) & 255) * f) | 0;
+  const g = Math.min(255, ((n >> 8) & 255) * f) | 0;
+  const b = Math.min(255, (n & 255) * f) | 0;
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+function drawBox(ctx, cam, f, w){
+  const z = cam.z, hpx = f.h * 34 * z;
+  const p = (gx, gy) => proj(cam, gx - 0.5, gy - 0.5);
+  const [ax, ay] = p(f.x, f.y), [bx, by] = p(f.x + f.w, f.y);
+  const [cx, cy] = p(f.x + f.w, f.y + f.d), [dx, dy] = p(f.x, f.y + f.d);
+  ctx.beginPath(); ctx.moveTo(ax, ay - hpx); ctx.lineTo(bx, by - hpx);
+  ctx.lineTo(cx, cy - hpx); ctx.lineTo(dx, dy - hpx); ctx.closePath();
+  ctx.fillStyle = f.color; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(bx, by - hpx); ctx.lineTo(cx, cy - hpx);
+  ctx.lineTo(cx, cy); ctx.lineTo(bx, by); ctx.closePath();
+  ctx.fillStyle = shade(f.color, 0.72); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(dx, dy - hpx); ctx.lineTo(cx, cy - hpx);
+  ctx.lineTo(cx, cy); ctx.lineTo(dx, dy); ctx.closePath();
+  ctx.fillStyle = shade(f.color, 0.55); ctx.fill();
+  if(f.label){
+    const [lx, ly] = proj(cam, f.x + f.w / 2 - 0.5, f.y + f.d / 2 - 0.5);
+    ctx.fillStyle = 'rgba(21,18,13,0.8)';
+    ctx.font = '700 ' + Math.max(8, 9 * z) + 'px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(f.label, lx, ly - hpx - 6 * z);
+  }
+  // your inbox: pending tasks stack up as paper on YOUR desk
+  if(f.id === 'desk-you' && w && w.tasks.pending > 0){
+    const [ix, iy] = proj(cam, f.x + f.w - 1, f.y - 0.15);
+    for(let i = 0; i < Math.min(8, w.tasks.pending); i++){
+      ctx.fillStyle = '#faf6ea';
+      ctx.strokeStyle = 'rgba(21,18,13,0.35)'; ctx.lineWidth = 1;
+      const py = iy - hpx - i * 3.2 * z;
+      ctx.beginPath();
+      ctx.moveTo(ix, py - 4 * z); ctx.lineTo(ix + 9 * z, py);
+      ctx.lineTo(ix, py + 4 * z); ctx.lineTo(ix - 9 * z, py);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    ctx.fillStyle = '#D8443F';
+    ctx.font = '800 ' + Math.max(9, 11 * z) + 'px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('×' + w.tasks.pending, ix, iy - hpx - Math.min(8, w.tasks.pending) * 3.2 * z - 6 * z);
+  }
+}
+
+function drawActor(ctx, cam, a, w){
+  const z = cam.z;
+  const [px, py] = proj(cam, a.x, a.y);
+  ctx.beginPath(); ctx.ellipse(px, py, 10 * z, 5 * z, 0, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(21,18,13,0.18)'; ctx.fill();
+  if(a.id === 'boss' && (a.mood === 'bad' || a.state === 'patrol')){
+    ctx.beginPath(); ctx.ellipse(px, py, 14 * z, 7 * z, 0, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(216,68,63,0.85)'; ctx.lineWidth = 2.5 * z; ctx.stroke();
+  }
+  ctx.beginPath(); ctx.ellipse(px, py - 11 * z, 8 * z, 11 * z, 0, 0, Math.PI * 2);
+  ctx.fillStyle = a.color; ctx.fill();
+  ctx.beginPath(); ctx.arc(px, py - 26 * z, 6.5 * z, 0, Math.PI * 2);
+  ctx.fillStyle = a.bear ? '#8a5a2b' : '#E8C39E'; ctx.fill();
+  if(a.bear){
+    ctx.beginPath(); ctx.arc(px - 5 * z, py - 31 * z, 2.6 * z, 0, Math.PI * 2);
+    ctx.arc(px + 5 * z, py - 31 * z, 2.6 * z, 0, Math.PI * 2);
+    ctx.fillStyle = '#6e4620'; ctx.fill();
+  }
+  if(a.lines){
+    ctx.font = (11 * z) + 'px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText(MOOD_FACE[a.mood], px + 11 * z, py - 32 * z);
+  }
+  // threat telegraphs: the floor-walk and the raid are readable at a glance
+  if(a.state === 'patrol' || a.state === 'raid'){
+    ctx.fillStyle = '#D8443F';
+    ctx.font = '800 ' + (14 * z) + 'px system-ui';
+    ctx.fillText('❗', px - 12 * z, py - 34 * z);
+  }
+  // your work-in-progress bar
+  if(a.id === 'you' && w && w.tasks.progress > 0 && playerAtDesk(w)){
+    const bw = 30 * z;
+    ctx.fillStyle = 'rgba(21,18,13,0.25)';
+    ctx.fillRect(px - bw / 2, py - 40 * z, bw, 5 * z);
+    ctx.fillStyle = '#2E9E63';
+    ctx.fillRect(px - bw / 2, py - 40 * z, bw * Math.min(1, w.tasks.progress), 5 * z);
+  }
+  ctx.fillStyle = 'rgba(21,18,13,0.65)';
+  ctx.font = '700 ' + Math.max(8, 8.5 * z) + 'px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(a.id === 'you' ? 'YOU' : a.name.split(' ')[0].toUpperCase(), px, py + 12 * z);
+}
+
+return {
+  GRID_W, GRID_H, TW, TH, CAST, FURNITURE, ZONES, OWNER_BY_ENC,
+  TASKS_PER_DAY, TASK_WORK_SECS, CRUNCH_CHANCE, CLOCK_SPEED,
+  setEncounters, newDay, step, resolveEncounter, resolveCrunch, eventsRemaining,
+  movePlayer, goForCoffee, goForCouch, requestChat, playerGoHome, playerAtDesk,
+  sendTo, bfsPath, isWalkable, adjacentTo, getActor,
+  pickActorAt, furnitureAt, isCoffeeAt, isCouchAt, statusOf, clockToMin, minToClock,
+  render, proj, screenToTile
+};
+})();
+
+// browser + headless-test exposure
+if (typeof window !== 'undefined') window.NtosWorld = NtosWorld;
+if (typeof module !== 'undefined' && module.exports) module.exports = NtosWorld;
+</script>
 <style>
 :root{
   /* Nine to Survive brand: bright cyan page, cream "sticker" panels, heavy black ink. */
