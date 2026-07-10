@@ -277,10 +277,42 @@ const NineToSurvive = (() => {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   }
 
+  // Clearly-scoped local generators for the arc engine: seeded off g.runSeed (and
+  // never touching g.rngState), so adding or reordering arcs can never shift the
+  // day-plan stream or any established balance numbers.
+  function hashStr(s){
+    let h = 2166136261 | 0;
+    for(let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+    return h | 0;
+  }
+  function localRand(seed){
+    let s = seed | 0;
+    return () => {
+      s = (s + 0x6D2B79F5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  // one-shot arc roll, unique per (run, arc, day, purpose)
+  function arcRand(g, key, salt){
+    return localRand((g.runSeed ^ hashStr(key) ^ Math.imul(g.day, 2654435761) ^ hashStr(salt || '')) | 0);
+  }
+
+  // Brad's cards, by ENCOUNTERS index. Once he's fired (or being walked out
+  // today), he stops delivering them — a dead man can't reassign your credit.
+  const BRAD_ENCS = [2, 9, 16];
+  function bradOutOfPlay(g){
+    if(!g.npcState || !g.npcState.brad) return false;
+    const a = (g.arcs && g.arcs.brad_second_job) || { stage: 0 };
+    return !!g.npcState.brad.flags.fired || a.stage === 6 || a.stage === 7;
+  }
+
   // Sample DAY_ENCOUNTERS distinct encounters for the day, replayed in clock order.
   // Prefers cards not yet seen this cycle (tracked on g.seen, so it serializes),
   // so a run tours the whole pool before anything repeats; then the cycle resets.
-  // Seeded and deterministic: same seed = same tour.
+  // Seeded and deterministic: same seed = same tour. Consults the Brad arc:
+  // with him out of play his cards leave the pool (identical rng stream otherwise).
   function planDay(g){
     if(!g.seen) g.seen = [];
     const pickFrom = (cands, n) => {
@@ -291,21 +323,32 @@ const NineToSurvive = (() => {
       }
       return pool.slice(0, n);
     };
-    const fresh = [];
-    for(let i = 0; i < ENCOUNTERS.length; i++) if(g.seen.indexOf(i) < 0) fresh.push(i);
+    const barred = bradOutOfPlay(g) ? BRAD_ENCS : [];
+    const inPool = [];
+    for(let i = 0; i < ENCOUNTERS.length; i++) if(barred.indexOf(i) < 0) inPool.push(i);
+    const fresh = inPool.filter(i => g.seen.indexOf(i) < 0);
     let plan;
     if(fresh.length >= DAY_ENCOUNTERS){
       plan = pickFrom(fresh, DAY_ENCOUNTERS);
       plan.forEach(i => g.seen.push(i));
-      if(g.seen.length >= ENCOUNTERS.length) g.seen = [];  // toured the pool: reset
+      if(g.seen.length >= inPool.length) g.seen = [];      // toured the pool: reset
     } else {
       plan = fresh.slice();                                // odd remainder: finish the cycle...
-      const rest = [];
-      for(let i = 0; i < ENCOUNTERS.length; i++) if(plan.indexOf(i) < 0) rest.push(i);
+      const rest = inPool.filter(i => plan.indexOf(i) < 0);
       plan = plan.concat(pickFrom(rest, DAY_ENCOUNTERS - plan.length));
       g.seen = plan.slice();                               // ...and start the next with today
     }
     return plan.sort((a, b) => a - b);
+  }
+
+  // The office lore layer: everyone you work with carries persistent state now.
+  // stress/trust move with incidents; flags hold arc secrets; counters feed
+  // headlines and share copy. All plain data — it rides the existing save.
+  const NPC_IDS = ['brad', 'boss', 'meredith', 'dennis', 'kayla', 'marcus', 'priya'];
+  function freshNpcState(){
+    const st = {};
+    NPC_IDS.forEach(id => { st[id] = { stress: 0, trust: 0, arcStage: 0, flags: {}, counters: {} }; });
+    return st;
   }
 
   // Fresh career. Day 1, Intern, seeded plan for the first day.
@@ -318,6 +361,12 @@ const NineToSurvive = (() => {
       lastChoice: null, dayReport: null,
       stats: { bradSteals: 0, crunchWins: 0, crunchFails: 0, warnings: 0 },
       taskStreak: 0, deadEyedToday: 0,
+      npcState: freshNpcState(),
+      arcs: {},              // per-arc runtime state, keyed by ARCS name — pure data
+      todayIncidents: [],    // [{id, owner, atMin}] the arcs staged for today
+      receipts: { count: 0, flags: {} },
+      feed: [],              // today's office feed: [{m: clockMin, text}]
+      runSeed: (seed == null ? 1 : seed) | 0,
       rngState: (seed == null ? 1 : seed) | 0
     };
     g.plan = planDay(g);
@@ -369,8 +418,19 @@ const NineToSurvive = (() => {
     chatMeh:    { s: 0, so:+3 },
     chatBad:    { s: 0, so:+2 },   // you listened to them vent; still counts
     couch:      { s:-1, so:+6 },   // seen lounging; worth it
-    coffee:     { s: 0, so:+2 }
+    coffee:     { s: 0, so:+2 },
+    bossHuman:  { s: 0, so:+2 }    // he was, briefly, a person
   };
+  // The Boss-spiral trap, priced: his confidant gets softer catches; the one
+  // who deflected gets harder ones — for the arc's duration only (the arc
+  // engine clears both flags when the spiral resolves).
+  function bossCatchMod(g){
+    const boss = g.npcState && g.npcState.boss;
+    if(!boss) return 0;
+    if(boss.flags.softCatch) return +2;
+    if(boss.flags.hardCatch) return -2;
+    return 0;
+  }
   // Dead-eyed productivity: ship GRIND_STREAK tasks in a row with no recovery
   // (coffee / couch / chat) and every further consecutive task bills 1 extra Soul.
   const GRIND_STREAK = 3;
@@ -380,7 +440,9 @@ const NineToSurvive = (() => {
     if(!e) return null;
     if(kind === 'bradSteal' && g.stats) g.stats.bradSteals++;
     const b = { s: g.standing, so: g.soul };
-    g.standing = clamp(g.standing + (e.s || 0));
+    const sMod = (kind === 'bossCatch' || kind === 'bossCatchBad')
+      ? bossCatchMod(g) + consumeCatchShield(g) : 0;
+    g.standing = clamp(g.standing + (e.s || 0) + sMod);
     g.soul     = clamp(g.soul + (e.so || 0));
     let deadEyed = false;
     if(kind === 'taskDone'){
@@ -396,6 +458,571 @@ const NineToSurvive = (() => {
     if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
     else if(g.soul <= 0 && !g.failed){ g.failed = 'soul'; g.over = true; }
     return { kind, ds: g.standing - b.s, dso: g.soul - b.so, deadEyed };
+  }
+
+  // ---- The office feed (brain side): the brain owns what is feed-worthy --------
+  // Entries are deterministic and come only from real events, moods, arc stages,
+  // and incidents. The shell just renders g.feed; it invents nothing.
+  function pushFeed(g, min, text){
+    if(!g.feed) g.feed = [];
+    g.feed.push({ m: min | 0, text });
+  }
+
+  // Morning gossip: only when a mood is actually notable — the feed reports the
+  // office, it does not decorate it. Boss news is mechanical intel and always
+  // leads; then at most two more lines, picked deterministically.
+  const MOOD_FEED = {
+    'boss|bad':      'The corner office calendar went private.',
+    'meredith|good': 'Meredith renamed #layoff-rumors to #culture-questions.',
+    'dennis|bad':    'Dennis changed the filename convention again.',
+    'priya|bad':     'Priya has been in the kitchen for 11 minutes.',
+    'priya|meh':     'Priya booked a focus block. Three people booked over it.',
+    'kayla|good':    'Kayla has been smiling at her phone all morning. Nobody asks. Everybody knows.',
+    'marcus|good':   'Marcus reacted with the eyes emoji to the all-hands invite.',
+    'brad|good':     'Brad posted “thrilled to share” at 9:04 AM.'
+  };
+  function moodFeed(g, moods){
+    if(g.feedMoodDay === g.day) return false;   // once per morning, resume-safe
+    g.feedMoodDay = g.day;
+    const cands = [];
+    (moods || []).forEach(mm => {
+      const id = mm.id === 'hr' ? 'meredith' : mm.id;   // world id → cast id
+      const line = MOOD_FEED[id + '|' + mm.mood];
+      if(line) cands.push({ id, line });
+    });
+    const bossLine = cands.find(c => c.id === 'boss');
+    const rest = cands.filter(c => c.id !== 'boss');
+    const r = arcRand(g, 'feed', 'morning');
+    const picks = bossLine ? [bossLine] : [];
+    while(rest.length && picks.length < (bossLine ? 3 : 2))
+      picks.push(rest.splice(Math.floor(r() * rest.length), 1)[0]);
+    picks.forEach((p, i) => pushFeed(g, 542 + i * 2, p.line));
+    return true;
+  }
+
+  // Floor events worth gossiping about. The shell calls this next to
+  // applyWorldEffect; the brain decides what's feed-worthy and how it reads.
+  const EVENT_FEED = {
+    bradSteal:    'Brad moved a file of yours into a folder called “Team Wins.”',
+    bossCatchBad: 'Everyone heard it. Everyone kept typing.',
+    crunch:       '“Quick fire drill, all hands on deck.” The deck is you.',
+    couch:        'Someone updated the wellness dashboard. It counts.',
+    summons:      '“got a sec” — the Boss, to you, with no agenda attached.'
+  };
+  function feedWorldEvent(g, kind, min){
+    const line = EVENT_FEED[kind];
+    if(!line) return false;
+    pushFeed(g, min, line);
+    return true;
+  }
+
+  // ---- Receipts: evidence is a resource ----------------------------------------
+  // Named flags + counts on g (serializes with the save). `count` = held now,
+  // `earned` = lifetime — awards and share copy read both.
+  function addReceipt(g, name){
+    if(!g.receipts) g.receipts = { count: 0, flags: {} };
+    if(g.receipts.flags[name]) return false;
+    g.receipts.flags[name] = true;
+    g.receipts.count++;
+    g.receipts.earned = (g.receipts.earned || 0) + 1;
+    return true;
+  }
+  function hasReceipt(g, name){ return !!(g.receipts && g.receipts.flags[name]); }
+  function burnReceipt(g, name){
+    if(!hasReceipt(g, name)) return false;
+    delete g.receipts.flags[name];
+    g.receipts.count--;
+    return true;
+  }
+
+  // ---- The arc engine: serialized office lore -----------------------------------
+  // An arc is a named multi-day storyline with numbered stages. advanceArcs(g)
+  // runs every morning inside nextDay and decides stage progression
+  // deterministically from the run seed + npcState — via LOCAL generators only,
+  // so adding, removing, or reordering arcs can never shift the day-plan stream
+  // or any established balance numbers. Arcs write plain-data stage flags; the
+  // world reads them (through worldFlagsFor) to stage physical clues, and
+  // planDay consults them (a fired Brad stops delivering Brad cards).
+  // A future arc = one more entry in this table plus its incident handlers.
+  const ARCS = {
+
+    // BRAD IS MOONLIGHTING. Ambitious, performative, insecure — and on two
+    // payrolls. Stages: 0 dormant · 1 the second laptop appears · 2 “on a call”
+    // + stairwell trips · 3 the deck detour past your desk · 4 the discovery
+    // card · 5 exposed, waiting · 6 fired today (watch the floor) · 7 gone ·
+    // 8 closed quietly (you covered, or the moment somehow passed).
+    brad_second_job: {
+      npc: 'brad',
+      advance(g, a){
+        const brad = g.npcState.brad;
+        if(a.stage === 0){
+          if(a.startDay == null)
+            a.startDay = 2 + Math.floor(localRand((g.runSeed ^ hashStr('brad_start')) | 0)() * 3);
+          if(g.day >= a.startDay){
+            a.stage = 1; brad.stress = 1;
+            pushFeed(g, 540, 'Brad deleted a message.');
+          }
+        } else if(a.stage === 1){
+          a.stage = 2; brad.stress = 2;
+          pushFeed(g, 555, 'Brad: “on a call.” It is 9:15.');
+        } else if(a.stage === 2){
+          a.stage = 3;
+          a.deckAt = 610 + Math.floor(arcRand(g, 'brad', 'deck')() * 210);   // 10:10–1:40
+        } else if(a.stage === 3 || a.stage === 4){
+          // the morning after the slip — and every morning until it's answered:
+          // the discovery card comes. It cannot strand a day; incidents gate
+          // 5 PM exactly like cards do.
+          a.stage = 4;
+          g.todayIncidents.push({ id: 'brad_discovery', owner: 'brad',
+            atMin: 620 + Math.floor(arcRand(g, 'brad', 'discovery')() * 250) });
+        } else if(a.stage === 5){
+          // exposed and unreported: some mornings, payroll does the math
+          a.waited = (a.waited || 0) + 1;
+          if(arcRand(g, 'brad', 'fired')() < 0.5){
+            a.stage = 6; brad.stress = 3;
+            pushFeed(g, 540, 'All-hands moved to 11:30. “Please plan to attend.” Nobody plans to attend. Everybody attends.');
+          } else if(a.waited >= 3){
+            a.stage = 8;
+            pushFeed(g, 540, 'Brad archived a channel nobody knew existed. The moment passed. Somehow the moment passed.');
+          }
+        } else if(a.stage === 6){
+          a.stage = 7;
+          brad.flags.fired = true;    // idempotent with the world event's report
+          pushFeed(g, 540, 'Brad’s desk is a rectangle of cleaner carpet. IT reclaimed “an asset.” The org chart heals over him by lunch.');
+        }
+      }
+    },
+
+    // THE BOSS IS GOING THROUGH SOMETHING. Week two or later his bad days get a
+    // cause and a pattern. Stages: 0 dormant · 1 hot · 2 resolved. While hot the
+    // world stages an extra floor walk, a raised crunch chance, and “quick call”
+    // summons: sympathize and Standing climbs, his catches soften, and the
+    // summons become daily; deflect (or dodge) and they stop, but his catches
+    // hit harder for the arc's duration. More human. Not less dangerous.
+    boss_spiral: {
+      npc: 'boss',
+      advance(g, a){
+        const boss = g.npcState.boss;
+        if(a.stage === 0){
+          if(a.startDay == null){
+            const r = localRand((g.runSeed ^ hashStr('boss_start')) | 0);
+            a.startDay = 6 + Math.floor(r() * 4);        // week two: day 6–9
+            a.hotDays  = 4 + Math.floor(r() * 3);        // hot for 4–6 days
+          }
+          a.summonsToday = null;
+          if(g.day >= a.startDay){
+            a.stage = 1; boss.stress = 2;
+            pushFeed(g, 540, 'Boss is typing…');
+            pushFeed(g, 541, 'Boss is typing…');
+            pushFeed(g, 544, 'The corner office door is closed. It is never closed.');
+            a.summonsToday = 620 + Math.floor(arcRand(g, 'boss', 'summons')() * 200);
+          }
+        } else if(a.stage === 1){
+          a.summonsToday = null;
+          if(g.day >= a.startDay + a.hotDays){
+            a.stage = 2;
+            delete boss.flags.softCatch;   // the modifiers live only while it's hot
+            delete boss.flags.hardCatch;
+            pushFeed(g, 540, 'The corner office door is open again. Nobody mentions the week. That is the arrangement.');
+          } else if(boss.flags.sympathetic){
+            // you are the office's emotional support animal now: daily summons
+            a.summonsToday = 620 + Math.floor(arcRand(g, 'boss', 'summons')() * 200);
+            pushFeed(g, 540, 'Boss is typing…');
+          } else if(!boss.flags.deflected){
+            // no answer yet: the quick call keeps being requested
+            a.summonsToday = 620 + Math.floor(arcRand(g, 'boss', 'summons')() * 200);
+          }
+        }
+      }
+    },
+
+    // KAYLA'S BIG PRESENTATION. She's overwhelmed, and the office is a machine
+    // for making that worse. Staged spatially: she's in the kitchen, her status
+    // shifts, the feed notices. The comedy target is the webinar, the invite,
+    // and the system — never her. Stages: 0 dormant · 1 panic day ·
+    // 2 aftermath (webinar day if HR was "helpful") · 3 filed.
+    kayla_presentation: {
+      npc: 'kayla',
+      advance(g, a){
+        const k = g.npcState.kayla;
+        if(a.stage === 0){
+          if(a.startDay == null)
+            a.startDay = 5 + Math.floor(localRand((g.runSeed ^ hashStr('kayla_start')) | 0)() * 4);
+          if(g.day >= a.startDay){
+            a.stage = 1; k.counters.panicDay = g.day;
+            pushFeed(g, 543, 'Kayla presents to leadership at 4:00. The deck is on version 31.');
+            pushFeed(g, 570, 'Kayla is in the kitchen. She has been “getting water” for forty minutes.');
+          }
+        } else if(a.stage === 1){
+          a.stage = 2;
+          if(k.flags.toldHR){
+            a.webinarDay = g.day;
+            pushFeed(g, 540, 'Mandatory invite: “Resilience & You,” 90 minutes, camera expected. The system that caused the problem is hosting a seminar on surviving it.');
+          } else if(k.flags.satWith || k.flags.tookTask){
+            pushFeed(g, 545, 'Kayla’s presentation went fine. Leadership asked one question: “can we get this as an email?”');
+          } else {
+            pushFeed(g, 545, 'Kayla presented on three hours of sleep. Leadership praised the “hustle” and scheduled more of it.');
+          }
+        } else if(a.stage === 2){
+          a.stage = 3;
+        }
+      }
+    },
+
+    // THE ANONYMOUS SURVEY IS NOT. Meredith launches a Pulse Survey; the next
+    // day she starts identifying authors, for culture. Stages: 0 dormant ·
+    // 1 survey day (the card comes) · 2 the hunt · 3 filed. The comedy target
+    // is the survey, the font, and the metadata. Never the respondents.
+    hr_survey: {
+      npc: 'meredith',
+      advance(g, a){
+        const mer = g.npcState.meredith;
+        if(a.stage === 0){
+          if(a.startDay == null)
+            a.startDay = 4 + Math.floor(localRand((g.runSeed ^ hashStr('survey_start')) | 0)() * 4);
+          if(g.day >= a.startDay){
+            a.stage = 1;
+            pushFeed(g, 543, 'Meredith launched the Pulse Survey. “Anonymous,” it says, in a font that knows your name.');
+            g.todayIncidents.push({ id: 'hr_survey', owner: 'hr',
+              atMin: 640 + Math.floor(arcRand(g, 'hr', 'survey')() * 220) });
+          }
+        } else if(a.stage === 1){
+          // unanswered somehow? it re-arrives, like all mandatory optional things
+          if(!mer.counters.surveyDay){
+            g.todayIncidents.push({ id: 'hr_survey', owner: 'hr',
+              atMin: 640 + Math.floor(arcRand(g, 'hr', 'survey')() * 220) });
+          } else {
+            a.stage = 2;
+            pushFeed(g, 548, 'Meredith is cross-referencing writing styles. For culture.');
+            pushFeed(g, 560, 'Meredith asked IT for “aggregate metadata.” IT went quiet.');
+          }
+        } else if(a.stage === 2){
+          a.stage = 3;
+          pushFeed(g, 545, 'The Pulse Survey results are in: engagement is up. Nobody remembers agreeing to that.');
+        }
+      }
+    },
+
+    // MARCUS HAS SEEN EVERYTHING. The survivor: funny, useful, slightly
+    // spiritually dead, never a fraud. Stages: 0 dormant · 1 mentor (permanent —
+    // coasting does not resolve). Once live, chatting with him delivers a tip.
+    marcus_survivor: {
+      npc: 'marcus',
+      advance(g, a){
+        if(a.stage === 0){
+          if(a.startDay == null)
+            a.startDay = 3 + Math.floor(localRand((g.runSeed ^ hashStr('marcus_start')) | 0)() * 3);
+          if(g.day >= a.startDay){
+            a.stage = 1;
+            pushFeed(g, 546, 'Marcus set his status to “surviving.” It has been his status since 2019.');
+          }
+        }
+      }
+    }
+  };
+
+  // Run every arc's stage logic. Called each morning from nextDay; fixed key
+  // order + local generators = deterministic no matter how the floor was played.
+  function advanceArcs(g){
+    if(!g.arcs) g.arcs = {};
+    Object.keys(ARCS).sort().forEach(key => {
+      if(!g.arcs[key]) g.arcs[key] = { stage: 0 };
+      ARCS[key].advance(g, g.arcs[key]);
+      const npc = g.npcState[ARCS[key].npc];
+      if(npc) npc.arcStage = g.arcs[key].stage;
+    });
+  }
+
+  // ---- Arc incidents: story cards, fired by the world like any card ------------
+  // Not deck expansion — these exist only when an arc stages them, and their
+  // choices move npcState, receipts, and arc stages along with the meters.
+  const ARC_INCIDENTS = {
+    brad_discovery: {
+      tag: 'Incident · The Second Laptop',
+      title: 'Wrong Deck, Brad.',
+      scene: 'Brad spins his chair to reach his coffee and his second laptop faces you, awake and honest, for four full seconds: a slide deck wearing another company’s logo. Header: “Q3 GTM — CONFIDENTIAL.” Their Q3. His name is on the title slide. He hasn’t noticed. You have unbroken line of sight and a phone.',
+      choices: [
+        { key:'screenshot', t:'Screenshot it. Both monitors. Timestamp visible.', s:0, so:+2,
+          o:'Click. It lives in your camera roll now, between a parking receipt and a photo of a sandwich. You feel the specific warmth of holding something that outranks the org chart.' },
+        { key:'cover', t:'“Brad. Screen.” Cover for him.', s:0, so:-6,
+          o:'He slams the lid and looks at you the way drowning men look at driftwood. “You’re solid,” he whispers. Complicit. The word is complicit. Your inbox, at least, is now a protected wetland.' },
+        { key:'ride', t:'See nothing. Sip your coffee. Let it ride.', s:0, so:+1,
+          o:'You turn back to your monitor and let the universe keep its own books. Whatever happens to Brad now was always going to happen. You are merely no longer load-bearing.' }
+      ]
+    },
+    hr_survey: {
+      tag: 'Incident · The Pulse Survey',
+      title: '“Anonymous. We Promise.”',
+      scene: 'The survey has eleven questions, a progress bar, and a required login. Question one asks how likely you are to recommend this workplace, 1 through 5. Question eleven asks for “any other context,” in a free-text box exactly the size of a career. The URL contains your employee ID.',
+      choices: [
+        { key:'bland', t:'Fives across the board. “No notes!”', s:+1, so:-4,
+          o:'Submitted in ninety seconds. Your five stars join the wall of five stars behind which nothing changes. Somewhere a dashboard turns a satisfying green, and a little more of you goes gray.' },
+        { key:'truth', t:'Tell the truth. All of it. Names, dates, the sync.', s:0, so:+8,
+          o:'You write it plainly and hit submit. It reads like testimony because it is. The survey is anonymous the way glass is private — expect your words to attend your next review without you.' },
+        { key:'help', t:'First, help a coworker phrase theirs safely.', s:0, so:+3,
+          o:'You translate their rage into “opportunities for process clarity.” It is a masterpiece of deniability. They owe you one, quietly, forever.' },
+        { key:'metadata', t:'Open the page source. Read the URL. Screenshot the “anonymous” form’s user ID field.', s:0, so:+2,
+          o:'response_id, employee_ref, session_token. You save it all. Anonymity has a schema, and now you have a copy. This will be useful the day a warning needs withdrawing.' }
+      ]
+    },
+    boss_quick_call: {
+      tag: 'Incident · The Quick Call',
+      title: '“You free? Quick call.”',
+      scene: 'The door closes. The Boss asks how you’re “finding the quarter,” then answers it himself for six minutes. On his monitor: an org chart with red outlines on some boxes. One of the red outlines is around his own box. He notices you noticing. “Realignment planning,” he says. “Anyway.”',
+      choices: [
+        { key:'sympathize', t:'“That sounds like a lot. How are YOU holding up?”', s:+3, so:-4,
+          o:'He talks for nineteen minutes. You learn about the reorg, a nemesis in Finance, and a boat he did not buy. You are his person now. The rate is one quick call per day until whichever ends first: the spiral, or you.' },
+        { key:'deflect', t:'“Happy to pick this up async — I’ve got a deliverable at two.”', s:-1, so:+2,
+          o:'“Right. Of course. Deliverables.” The door opens with a punctuation you will hear again the next time he passes your empty chair. The summons stop. The ledger doesn’t.' }
+      ]
+    }
+  };
+
+  // Meter movement for anything that isn't a deck card: same clamps, same fail
+  // states, one place.
+  function applyStoryDelta(g, s, so){
+    const b = { s: g.standing, so: g.soul };
+    g.standing = clamp(g.standing + (s || 0));
+    g.soul     = clamp(g.soul + (so || 0));
+    if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
+    else if(g.soul <= 0 && !g.failed){ g.failed = 'soul'; g.over = true; }
+    return { ds: g.standing - b.s, dso: g.soul - b.so };
+  }
+
+  // Resolve an arc incident choice: meters move, npcState/receipts/arc stages
+  // follow. `min` is the world clock (for the feed's timestamps).
+  function applyIncidentChoice(g, id, choiceIndex, min){
+    const def = ARC_INCIDENTS[id];
+    if(!def || !def.choices[choiceIndex]) return null;
+    const c = def.choices[choiceIndex];
+    const d = applyStoryDelta(g, c.s, c.so);
+    const brad = g.npcState.brad;
+    if(id === 'brad_discovery'){
+      const a = g.arcs.brad_second_job;
+      brad.counters.discoveries = (brad.counters.discoveries || 0) + 1;
+      brad.counters.discoveryDay = g.day;
+      if(c.key === 'screenshot'){
+        addReceipt(g, 'screenshot_brad_deck');
+        brad.stress = 3; a.stage = 5;
+        pushFeed(g, min, 'Brad deleted a message.');
+        pushFeed(g, (min || 0) + 2, 'Brad deleted another message.');
+      } else if(c.key === 'cover'){
+        brad.trust += 3; brad.flags.covered = true; a.stage = 8;
+        pushFeed(g, min, 'Brad sent you a gif of a saluting otter, in a channel with two members. This is a binding contract now.');
+      } else {
+        a.stage = 5;
+        pushFeed(g, min, 'Brad turned his desk eleven degrees away from the aisle. Feng shui, he said.');
+      }
+    }
+    if(id === 'hr_survey'){
+      const mer = g.npcState.meredith;
+      mer.counters.surveyDay = g.day;
+      if(c.key === 'truth'){
+        mer.flags.truthTold = true;
+        pushFeed(g, min, 'Someone submitted seven paragraphs. Meredith has opened a thesaurus.');
+      } else if(c.key === 'help'){
+        const peers = ['kayla', 'priya', 'marcus'];
+        const who = peers[Math.floor(arcRand(g, 'hr', 'peer')() * peers.length)];
+        g.npcState[who].trust += 2;
+        mer.counters.helped = who;
+        pushFeed(g, min, who.charAt(0).toUpperCase() + who.slice(1) + '’s survey response is a masterpiece of deniability. You are thanked in the metadata.');
+      } else if(c.key === 'metadata'){
+        addReceipt(g, 'hr_survey_metadata');
+        pushFeed(g, min, 'Someone viewed the survey’s page source for eleven minutes. Anonymously, of course.');
+      } else {
+        pushFeed(g, min, 'Early Pulse results: morale is “strong.” The word is doing a lot of shifts.');
+      }
+    }
+    if(id === 'boss_quick_call'){
+      const boss = g.npcState.boss;
+      boss.counters.quickCalls = (boss.counters.quickCalls || 0) + 1;
+      boss.counters.callDay = g.day;
+      if(c.key === 'sympathize'){
+        boss.trust += 1;
+        boss.flags.sympathetic = true; boss.flags.softCatch = true;
+        delete boss.flags.deflected; delete boss.flags.hardCatch;
+        pushFeed(g, min, 'The corner office door was closed for nineteen minutes. You were on the wrong side of it. Or the right side. Unclear.');
+      } else {
+        boss.flags.deflected = true; boss.flags.hardCatch = true;
+        delete boss.flags.sympathetic; delete boss.flags.softCatch;
+        pushFeed(g, min, 'The quick call was quick. The silence after it wasn’t.');
+      }
+    }
+    g.lastChoice = { choiceIndex, ds: d.ds, dso: d.dso, outcome: c.o };
+    return g.lastChoice;
+  }
+
+  // ---- Marcus's coasting tips: delivered through chats once his arc is live -----
+  // Some help mechanically; roughly one in four miscalibrates, because detachment
+  // is a skill with error bars. Seeded per (run, day); once per day via the
+  // existing one-chat-per-peer rule.
+  const MARCUS_TIPS = [
+    { kind:'bosswalk', text:'Marcus, without looking up: “He does his second lap after lunch. Be a chair.”',
+      feed:'Marcus has seen this exact all-hands before, including the typo.' },
+    { kind:'delay', text:'“That one in your stack? Nobody reads it before Thursday. Let it breathe.” One missed task forgiven at 5 PM.',
+      feed:'Marcus says the reorg will be reversed by October.' },
+    { kind:'shield', text:'“When he asks where you were, say ‘load-bearing deliverable.’ Works exactly once.” Next catch softened.',
+      feed:'Marcus declined a meeting so calmly it became philosophical.' },
+    { kind:'miscal', text:'“The 2:30 is skippable. Trust me.” It was not skippable. Standing −2.',
+      feed:'Marcus said “this too shall pass.” It has not passed.' }
+  ];
+  function marcusTip(g, min){
+    const m = g.npcState.marcus;
+    if(((g.arcs || {}).marcus_survivor || { stage: 0 }).stage < 1) return null;
+    if(m.counters.tipDay === g.day) return null;
+    m.counters.tipDay = g.day;
+    m.counters.tips = (m.counters.tips || 0) + 1;
+    const r = arcRand(g, 'marcus', 'tip');
+    const tip = r() < 0.25 ? MARCUS_TIPS[3] : MARCUS_TIPS[Math.floor(r() * 3)];
+    if(tip.kind === 'delay') g.taskForgivenessToday = true;
+    else if(tip.kind === 'shield') m.flags.shield = true;
+    else if(tip.kind === 'miscal'){ applyStoryDelta(g, -2, 0); m.counters.miscals = (m.counters.miscals || 0) + 1; }
+    pushFeed(g, min, tip.feed);
+    return { kind: tip.kind, text: tip.text };
+  }
+  // Marcus's phrase deflects exactly one catch (consumed on use).
+  function consumeCatchShield(g){
+    const m = g.npcState && g.npcState.marcus;
+    if(!m || !m.flags.shield) return 0;
+    delete m.flags.shield;
+    return +2;
+  }
+
+  // ---- Kayla's panic day: the player's options, priced -----------------------------
+  function kaylaSitWith(g, min){
+    const k = g.npcState.kayla;
+    if(k.flags.satWith) return null;
+    k.flags.satWith = true; k.flags.bonded = true; k.trust += 2;
+    const d = applyStoryDelta(g, 0, +4);
+    pushFeed(g, min, 'Two chairs in the kitchen. No agenda. It helped more than the deck did.');
+    return { dso: d.dso, text: 'You sit with her. No advice, no pep talk, just company and a shared opinion about slide 14. The clock keeps billing you. Worth it.' };
+  }
+  function kaylaTaskTaken(g, min){
+    const k = g.npcState.kayla;
+    if(k.flags.tookTask) return null;
+    k.flags.tookTask = true; k.trust += 1;
+    const d = applyStoryDelta(g, 0, +1);
+    pushFeed(g, min, 'A deliverable quietly changed owners. No email announced it. That is how you know it was kind.');
+    return { dso: d.dso, text: 'You take the competitor summary off her stack and onto yours. Her deck loses a subplot; your inbox gains one.' };
+  }
+  function kaylaSentHome(g, min){
+    const k = g.npcState.kayla;
+    if(k.flags.toldHR) return null;
+    k.flags.toldHR = true; k.trust -= 2;
+    const d = applyStoryDelta(g, +1, 0);   // the org rewards "flagging a risk"
+    pushFeed(g, min, 'Meredith walked to the kitchen with her Concerned Face. Kayla is being sent home “out of an abundance of care.”');
+    pushFeed(g, (min || 0) + 4, 'The presentation was moved, not cancelled. The problem was moved, not solved.');
+    return { ds: d.ds, text: 'You mention it to Meredith, gently, meaning well. HR solves the person instead of the workload. Kayla is sent home. A calendar invite is already forming somewhere, like weather.' };
+  }
+  // The dead-eyed play: you watched and kept shipping. Priced at day end.
+  const WATCHED_SOUL = 3;
+  function kaylaWatchedPrice(g, report){
+    const a = (g.arcs || {}).kayla_presentation;
+    const k = g.npcState && g.npcState.kayla;
+    if(!a || a.stage !== 1 || !k) return;
+    if(k.flags.satWith || k.flags.tookTask || k.flags.toldHR) return;
+    soulHit(g, WATCHED_SOUL);
+    report.watchedKayla = true;
+    pushFeed(g, 1018, 'Productivity held steady today. The dashboard is very proud of everyone.');
+  }
+  // Sitting with her that day permanently improves what her chats give back.
+  function chatBonus(g, who){
+    if(who === 'kayla' && g.npcState.kayla.flags.bonded){
+      const d = applyStoryDelta(g, 0, +2);
+      return d.dso;
+    }
+    return 0;
+  }
+
+  // Never found time for the quick call: the office reads that as an answer.
+  function bossSummonsDodged(g, min){
+    const boss = g.npcState.boss;
+    if(boss.flags.deflected || boss.flags.sympathetic) return false;
+    boss.flags.deflected = true; boss.flags.hardCatch = true;
+    pushFeed(g, min, '“got a sec” expired unanswered. It has been noted somewhere with columns.');
+    return true;
+  }
+
+  // The one genuinely human beat, off-schedule, once per run. World moment, not
+  // a card: the world spots the proximity, the brain owns the words and the gate.
+  function bossHumanBeat(g, min){
+    const boss = g.npcState.boss;
+    if(boss.flags.humanBeat) return null;
+    boss.flags.humanBeat = true;
+    pushFeed(g, min, 'The Boss stood at the window for four minutes. The window does not have KPIs.');
+    return 'You catch the Boss rehearsing “streamlining is a kindness” at the window. He nods. Human, briefly.';
+  }
+
+  // The receipt play: holding the screenshot gives Brad's Credit-Reassigned card
+  // a fourth choice that burns it to reverse the theft, with interest.
+  const CREDIT_ENC = 2;
+  function extraChoicesFor(g, encIdx){
+    if(encIdx === CREDIT_ENC && hasReceipt(g, 'screenshot_brad_deck') && !bradOutOfPlay(g)){
+      return [{ key: 'burn_screenshot',
+        t: '“Quick question before we move on — Brad, how’s Q3 tracking at the other place?” Screen-share the screenshot.' }];
+    }
+    return [];
+  }
+  function applyExtraChoice(g, encIdx, key, min){
+    if(key !== 'burn_screenshot' || encIdx !== CREDIT_ENC) return null;
+    if(!burnReceipt(g, 'screenshot_brad_deck')) return null;
+    const d = applyStoryDelta(g, +10, +8);   // the theft, reversed, with interest
+    const brad = g.npcState.brad;
+    brad.trust -= 3; brad.stress = 3; brad.flags.burned = true;
+    const a = g.arcs.brad_second_job;
+    if(a && a.stage === 8 && !brad.flags.covered){ a.stage = 5; a.waited = 0; }  // the moment un-passes
+    pushFeed(g, min, 'The projector saw everything. So did Meredith.');
+    g.lastChoice = { choiceIndex: 'burn_screenshot', ds: d.ds, dso: d.dso,
+      outcome: 'You put his other logo on the big screen, right next to your analysis. The room does the math at different speeds; the boss gets there last, then all at once. Your work is yours again, retroactively, with interest. Brad’s calendar goes “busy” for the rest of the afternoon.' };
+    return g.lastChoice;
+  }
+
+  // ---- Brad-arc world moments: the world stages them, the brain records them ----
+  function bradDeckSeen(g, min){
+    const brad = g.npcState.brad;
+    if(brad.flags.deckSeen) return false;
+    brad.flags.deckSeen = true;
+    pushFeed(g, min, 'Brad walked the long way past your desk carrying slides for a company that is not this company. Slide 4 said “Our Q3.” Not our our.');
+    return true;
+  }
+  function bradAllHands(g, min){
+    pushFeed(g, min, 'Brad joined the all-hands from a conference room with another company’s name in the Zoom background. Legal joined the thread. Everyone became normal.');
+  }
+  function bradFiredReport(g, min){
+    const brad = g.npcState.brad;
+    brad.flags.fired = true; brad.flags.walkedOut = true;
+    brad.counters.firedDay = g.day;
+    if(g.arcs.brad_second_job && g.arcs.brad_second_job.stage === 6) g.arcs.brad_second_job.stage = 7;
+    pushFeed(g, min, 'Meredith walked Brad to the door holding a box he was not allowed to carry himself. “We wish him well,” she said, in the past tense, while he was still in the room.');
+  }
+  function bradTasksAbsorbed(g, min){
+    pushFeed(g, min, 'Two of Brad’s deliverables just landed in your inbox. The email says “congratulations on the growth opportunity.” It is not a growth opportunity.');
+  }
+
+  // Everything the world needs to stage today, as plain data. The world module
+  // never reads g directly — this is the one bridge, and it's one-way.
+  function worldFlagsFor(g){
+    const A  = g.arcs || {};
+    const b  = A.brad_second_job || { stage: 0 };
+    const bo = A.boss_spiral || { stage: 0 };
+    const ka = A.kayla_presentation || { stage: 0 };
+    const brad = (g.npcState && g.npcState.brad) || { flags: {} };
+    const kayla = (g.npcState && g.npcState.kayla) || { flags: {} };
+    return {
+      kaylaPanic:     ka.stage === 1 && !kayla.flags.toldHR,
+      webinarUntil:   (ka.stage === 2 && ka.webinarDay === g.day) ? 630 : null,
+      bradLaptop:     b.stage >= 1 && b.stage <= 6,   // the second laptop, drawn
+      bradCalls:      b.stage >= 2 && b.stage <= 6,   // status shifts + stairwell trips
+      bradDeckAt:     b.stage === 3 ? b.deckAt : null,
+      bradFiredToday: b.stage === 6,
+      bradGone:       b.stage === 7,     // stage 8 = closed quietly; he's still here
+      noBradRaids:    !!brad.flags.covered || b.stage === 6 || b.stage === 7,
+      bossArcHot:     bo.stage === 1,
+      extraBossWalks: bo.stage === 1 ? 1 : 0,
+      crunchBoost:    bo.stage === 1 ? 0.25 : 0,
+      bossSummonsAt:  (bo.stage === 1 && bo.summonsToday) || null,
+      incidents:      (g.todayIncidents || []).slice()
+    };
   }
 
   // Advance past a resolved card. Cards no longer end the day — 5 PM does.
@@ -417,10 +1044,12 @@ const NineToSurvive = (() => {
     const pay = LADDER[g.jobIdx].pay;
     const burn = burnFor(g.week);
     const drain = soulDrainFor(g.week);
-    const missed = Math.max(0, stats.tasksTotal - stats.tasksDone);
+    let missed = Math.max(0, stats.tasksTotal - stats.tasksDone);
+    let forgiven = false;
+    if(g.taskForgivenessToday && missed > 0){ missed--; forgiven = true; }   // Marcus was right
     const report = { day: g.day, week: g.week, title: jobTitle(g), pay, burn, drain,
                      tasksDone: stats.tasksDone, tasksTotal: stats.tasksTotal,
-                     missed, decay: DECAY_S,
+                     missed, forgiven, decay: DECAY_S,
                      deadEyed: g.deadEyedToday || 0,
                      broke: false, promoted: false, warned: false, newTitle: null };
     // the treadmill: yesterday's hero + whatever died in the inbox
@@ -429,13 +1058,33 @@ const NineToSurvive = (() => {
     g.money += pay - burn;
     if(g.money < 0){ g.money = 0; report.broke = true; if(!g.failed) soulHit(g, BROKE_SOUL); }
     if(!g.failed) soulHit(g, drain);
+    if(!g.failed) kaylaWatchedPrice(g, report);
     if(!g.failed && g.day % 5 === 0){ // Friday review
-      if(g.standing >= PROMOTE_AT && g.jobIdx < LADDER.length - 1){
+      // the "anonymous" survey attends your review without you — once
+      const mer = g.npcState && g.npcState.meredith;
+      if(mer && mer.flags.truthTold && !mer.flags.truthBilled){
+        mer.flags.truthBilled = true;
+        g.standing = clamp(g.standing - 5);
+        report.truthBill = true;
+        pushFeed(g, 1019, 'Your survey answers attended your review. Anonymously.');
+        if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
+      }
+      if(g.failed){ /* the bill can end it */ }
+      else if(g.standing >= PROMOTE_AT && g.jobIdx < LADDER.length - 1){
         g.jobIdx++; g.standing = PROMOTE_RESET; soulHit(g, PROMOTE_SOUL);
         report.promoted = true; report.newTitle = jobTitle(g);
+        pushFeed(g, 1020, 'A promotion was announced. The word “journey” was used twice.');
       } else if(g.standing < WARN_AT){
-        soulHit(g, WARN_SOUL); report.warned = true;
-        if(g.stats) g.stats.warnings++;
+        if(hasReceipt(g, 'hr_survey_metadata')){
+          // the receipt defuses exactly one warning, then it's spent
+          burnReceipt(g, 'hr_survey_metadata');
+          report.warningDefused = true;
+          pushFeed(g, 1020, 'The warning was withdrawn after you asked, politely, about survey response IDs.');
+        } else {
+          soulHit(g, WARN_SOUL); report.warned = true;
+          if(g.stats) g.stats.warnings++;
+          pushFeed(g, 1020, 'Meredith created a document. The filename contains your name and the word “alignment.”');
+        }
       }
     }
     report.money = g.money;
@@ -443,11 +1092,61 @@ const NineToSurvive = (() => {
     return g.failed ? 'gameover' : 'dayend';
   }
 
+  // ---- The day's headline + award: drawn from what actually happened -----------
+  // Deterministic, first-match priority, no invented events. The fallbacks are
+  // the only lines allowed to admit nothing happened.
+  function dayHeadline(g){
+    const rep = g.dayReport || {};
+    const d = 'Day ' + (rep.day || g.day) + ': ';
+    const brad = g.npcState.brad, boss = g.npcState.boss;
+    if(brad.counters.firedDay === rep.day)
+      return d + 'Brad was walked out holding a box he was not allowed to carry.';
+    if(brad.counters.discoveryDay === rep.day)
+      return d + 'a laptop faced the wrong direction for four full seconds.';
+    if(boss.counters.callDay === rep.day && boss.flags.sympathetic)
+      return d + 'you became the corner office’s emotional support animal.';
+    if(boss.counters.callDay === rep.day)
+      return d + 'a quick call was survived at async speed.';
+    if(g.npcState.meredith.counters.surveyDay === rep.day)
+      return d + 'HR discovered anonymity has a font.';
+    if(g.npcState.kayla.counters.panicDay === rep.day && g.npcState.kayla.flags.toldHR)
+      return d + 'HR solved a person instead of a workload.';
+    if(g.npcState.kayla.counters.panicDay === rep.day && g.npcState.kayla.flags.satWith)
+      return d + 'two chairs in the kitchen. It helped.';
+    if(((g.arcs || {}).kayla_presentation || {}).webinarDay === rep.day)
+      return d + '“Resilience & You” ate ninety minutes of resilience.';
+    if(rep.warningDefused) return d + 'a warning met a metadata screenshot and blinked first.';
+    if(rep.promoted) return d + 'promoted. The bar moved. It saw you coming.';
+    if(rep.warned) return d + 'HR opened a document with your name in the filename.';
+    if(rep.deadEyed >= 2) return d + 'three tasks in a row without blinking. HR calls it “flow.”';
+    if(rep.forgiven) return d + 'Marcus was right about Thursday.';
+    if(rep.broke) return d + 'the ATM asked if you were sure.';
+    return d + 'survived.';
+  }
+  function dayAward(g){
+    const rep = g.dayReport || {};
+    const brad = g.npcState.brad, boss = g.npcState.boss;
+    if(brad.counters.firedDay === rep.day || brad.counters.discoveryDay === rep.day)
+      return 'Main Character of the Day';
+    if(g.receipts && g.receipts.count > 0) return 'Least Legally Defensible';
+    if(rep.deadEyed >= 1) return 'Most Dead Inside';
+    if(boss.counters.callDay === rep.day && boss.flags.sympathetic)
+      return 'Office Emotional Support Animal';
+    if(rep.tasksTotal > 0 && rep.tasksDone >= rep.tasksTotal) return 'Best Supporting Spreadsheet';
+    return 'Employee of the Month (Not This Month)';
+  }
+
   // The morning after a survived day: new date, fresh plan, the night forgives.
+  // Arcs advance FIRST — a fired Brad changes what planDay may pick — and they
+  // use local generators, so the g.rngState stream planDay consumes is untouched.
   function nextDay(g){
     g.day++; g.week = Math.floor((g.day - 1) / 5) + 1;
-    g.idxInDay = 0; g.plan = planDay(g); g.dayReport = null;
+    g.idxInDay = 0; g.dayReport = null;
     g.taskStreak = 0; g.deadEyedToday = 0;
+    g.taskForgivenessToday = false;
+    g.feed = []; g.todayIncidents = [];
+    advanceArcs(g);
+    g.plan = planDay(g);
   }
 
   // Fire drill (a crunch, not a fire): deliver under a timer or eat a Standing hit.
@@ -507,6 +1206,51 @@ const NineToSurvive = (() => {
     };
   }
 
+  // ---- Share copy that carries the story ----------------------------------------
+  // The lead line is the run's best real incident, from counters, receipts, and
+  // arc outcomes — never invented. Returns null when the run produced no story
+  // (the shell then falls back to the plain format).
+  function storyLine(g){
+    const brad = g.npcState.brad, boss = g.npcState.boss;
+    const s = g.stats || {};
+    if(brad.flags.walkedOut)
+      return 'I watched Brad get walked out at lunch for working two jobs. His deliverables are my “growth opportunity” now.';
+    if(brad.flags.burned)
+      return 'I put Brad’s other job on the projector mid-meeting. My analysis is mine again. With interest.';
+    if(g.escaped && hasReceipt(g, 'screenshot_brad_deck'))
+      return 'I escaped on Day ' + g.day + ' with ' + fmt(g.money) + ', ' + g.soul
+        + ' Soul, and one screenshot that could end Brad’s quarter.';
+    if(hasReceipt(g, 'screenshot_brad_deck'))
+      return 'Holding one screenshot that could end Brad’s quarter. Haven’t decided. That’s the fun part.';
+    if(hasReceipt(g, 'hr_survey_metadata'))
+      return 'Survived an anonymous survey that knew my middle name. I kept the metadata.';
+    if(brad.flags.covered)
+      return 'I caught Brad working a second job and covered for him. My inbox is a protected wetland. My soul, less so.';
+    if(boss.flags.sympathetic && (boss.counters.quickCalls || 0) >= 2)
+      return 'I became the corner office’s emotional support animal. Standing: excellent. Soul: on file with HR.';
+    if(g.failed === 'standing')
+      return 'Managed out on Day ' + g.day + '. HR called it a transition, which is how you know it was a firing.';
+    if(g.failed === 'soul')
+      return 'Promoted to management on Day ' + g.day + '. Please do not congratulate me.';
+    const bits = [];
+    if(s.crunchWins + s.crunchFails > 0) bits.push((s.crunchWins + s.crunchFails) + ' fire drill' + (s.crunchWins + s.crunchFails > 1 ? 's' : ''));
+    if(s.bradSteals > 0) bits.push(s.bradSteals + ' Brad theft' + (s.bradSteals > 1 ? 's' : ''));
+    if(s.warnings > 0) bits.push(s.warnings + ' formal warning' + (s.warnings > 1 ? 's' : ''));
+    if(bits.length >= 2) return 'Survived ' + bits.join(', ').replace(/, ([^,]*)$/, ', and $1') + '.';
+    return null;
+  }
+  function shareText(g){
+    const headline = g.over ? verdict(g).title : 'Still there. Still counting.';
+    const story = storyLine(g);
+    const lines = ['NINE TO SURVIVE — YOUR NUMBER'];
+    if(story) lines.push(story);
+    lines.push('Day ' + g.day + ' · ' + headline);
+    lines.push('Banked ' + fmt(g.money) + ' / ' + fmt(FU_TARGET) + ' · Standing ' + g.standing + ' · Soul ' + g.soul);
+    if(!story) lines.push('An unremarkable tenure, which was the plan.');
+    lines.push('Ungovernable. Unapologetic.');
+    return lines.join('\n');
+  }
+
   return {
     START, ENCOUNTERS, LADDER,
     FU_TARGET, DAY_ENCOUNTERS, BURN_BASE, BURN_STEP,
@@ -516,7 +1260,15 @@ const NineToSurvive = (() => {
     clamp, fmt, burnFor, soulDrainFor,
     newGame, planDay, currentEncounter, isFinalEncounter, jobTitle,
     applyChoice, advance, closeDay, nextDay, canWalkOut, walkOut, verdict,
-    applyCrunch, applyCoffee, applyWorldEffect
+    applyCrunch, applyCoffee, applyWorldEffect,
+    NPC_IDS, ARCS, advanceArcs, worldFlagsFor,
+    pushFeed, moodFeed, feedWorldEvent, addReceipt, hasReceipt, burnReceipt,
+    ARC_INCIDENTS, applyIncidentChoice, extraChoicesFor, applyExtraChoice,
+    BRAD_ENCS, bradOutOfPlay, bradDeckSeen, bradAllHands, bradFiredReport, bradTasksAbsorbed,
+    bossSummonsDodged, bossHumanBeat, bossCatchMod,
+    marcusTip, consumeCatchShield, dayHeadline, dayAward,
+    kaylaSitWith, kaylaTaskTaken, kaylaSentHome, chatBonus, WATCHED_SOUL,
+    storyLine, shareText
   };
 })();
 
@@ -576,11 +1328,14 @@ const FURNITURE = [
   { id:'plant-2',     label:null,        x:30, y:10, w:1, d:1, h:0.9,  color:'#4e7a4e' },
   { id:'plant-3',     label:null,        x:2,  y:12, w:1, d:1, h:0.9,  color:'#4e7a4e' },
   { id:'couch',       label:'COUCH',     x:2,  y:22, w:3, d:1, h:0.5,  color:'#b56a4f' },
+  { id:'stairs',      label:'STAIRS',    x:38, y:12, w:1, d:2, h:0.9,  color:'#6b675e' },
   { id:'exit',        label:'EXIT',      x:0,  y:16, w:1, d:2, h:1.1,  color:'#2E9E63' }
 ];
 const COFFEE_SPOT = { x:22, y:9 };
 const COUCH_SPOT  = { x:3,  y:21 };
 const EXIT_SPOT   = { x:1,  y:17 };
+const STAIRS_SPOT = { x:37, y:13 };   // where the private calls happen
+const KITCHEN_CORNER = { x:24, y:12 };   // where Kayla "gets water" on the bad day
 
 // ── zones: colored floor rugs with labels ─────────────────────────────────────
 const ZONES = [
@@ -715,12 +1470,16 @@ function adjacentTo(w, actor){
 
 // ── world construction ────────────────────────────────────────────────────────
 // plan = the day's encounter indices from NineToSurvive (already clock-ordered).
-function newDay(seed, day, plan){
+// flags = NineToSurvive.worldFlagsFor(g): arc stage flags the world stages
+// physically (clues, detours, the firing, incident cards). Plain data, one-way.
+function newDay(seed, day, plan, flags){
+  flags = flags || {};
   const w = {
     day,
+    flags,
     rngState: ((seed | 0) ^ Math.imul(day, 2654435761)) | 0,
     walk: buildWalkGrid(),
-    actors: CAST.map(c => ({
+    actors: CAST.filter(c => !(flags.bradGone && c.id === 'brad')).map(c => ({
       id: c.id, name: c.name, role: c.role, color: c.color, bear: !!c.bear,
       chat: !!c.chat,
       x: c.spot.x, y: c.spot.y, home: { x: c.spot.x, y: c.spot.y },
@@ -730,12 +1489,16 @@ function newDay(seed, day, plan){
     clockMin: 540,           // 9:00 AM
     running: true,
     sig: [],                 // signal queue → shell drains via step()'s return
-    // cards (rare spice): owner walks over at the card's clock time
+    // cards (rare spice) + any arc incidents: the owner walks over at the
+    // event's clock minute. One sorted queue; incidents gate 5 PM like cards.
     events: plan.map(encIdx => ({
-      encIdx, owner: OWNER_BY_ENC[encIdx],
+      kind: 'card', encIdx, owner: OWNER_BY_ENC[encIdx],
       atMin: clockToMin(_encounters[encIdx].clock),
       status: 'pending'      // pending → walking → active → done
-    })),
+    })).concat((flags.incidents || []).map(inc => ({
+      kind: 'incident', id: inc.id, owner: inc.owner, atMin: inc.atMin,
+      status: 'pending'
+    }))).sort((a, b) => a.atMin - b.atMin),
     nextEvent: 0,
     activeEvent: null,
     // the actual work: tasks land in your inbox through the day (load seeded below)
@@ -745,6 +1508,14 @@ function newDay(seed, day, plan){
     bossWalks: [],           // [{atMin, status:'pending'|'out'|'done'}]
     bradRaids: [],
     crunch: null,            // {atMin, status}
+    // Brad-arc staging: the deck detour and the firing you can watch
+    bradDeck: flags.bradDeckAt ? { atMin: flags.bradDeckAt, status: 'pending' } : null,
+    firing: flags.bradFiredToday ? { phase: 'wait' } : null,
+    // Boss-arc staging: the quick-call summons (walk over, or let it expire)
+    summons: flags.bossSummonsAt
+      ? { atMin: flags.bossSummonsAt, expireAt: flags.bossSummonsAt + 90, status: 'pending' }
+      : null,
+    bossHumanDone: false,
     // recovery economy (once a day each)
     coffeeUsed: false, couchUsed: false, chatted: {},
     playerErrand: null,      // {type:'coffee'|'couch'|'chat'|'exit', id?, repaths}
@@ -757,21 +1528,33 @@ function newDay(seed, day, plan){
     a.wanderT = 2 + rand(w) * 6;
     if(a.id !== 'you') a.mood = MOODS[Math.floor(rand(w) * 3)];
   });
+  // Kayla's panic day: she's in the kitchen, and she's staying there
+  if(flags.kaylaPanic){
+    const kayla = getActor(w, 'kayla');
+    if(kayla){ kayla.x = KITCHEN_CORNER.x; kayla.y = KITCHEN_CORNER.y; kayla.pinned = true; kayla.mood = 'bad'; }
+  }
+  w.kaylaTaskTaken = false;
+  w.kaylaReported = false;
+  w.webinarAnnounced = false;
   // task drip: seeded daily load, 3 waiting at 9:00, the rest spread to ~3:30
   w.tasks.total = TASKS_MIN + Math.floor(rand(w) * (TASKS_MAX - TASKS_MIN + 1));
   w.tasks.spawnAt = [540, 540, 540];
   const drip = Math.floor(390 / Math.max(1, w.tasks.total - 3));
   for(let i = 3; i < w.tasks.total; i++) w.tasks.spawnAt.push(560 + (i - 3) * drip);
-  // boss floor-walks: two, spaced through the day
-  for(let i = 0; i < BOSS_WALKS_PER_DAY; i++)
-    w.bossWalks.push({ atMin: 620 + i * 170 + Math.floor(rand(w) * 60), status: 'pending' });
-  // brad raids: one or two
-  const raids = 1 + (rand(w) < 0.5 ? 1 : 0);
+  // boss floor-walks: two, spaced through the day (+1 while his arc runs hot)
+  const walks = BOSS_WALKS_PER_DAY + (flags.extraBossWalks || 0);
+  for(let i = 0; i < walks; i++)
+    w.bossWalks.push({ atMin: Math.min(990, 620 + i * (walks > 2 ? 130 : 170) + Math.floor(rand(w) * 60)),
+                       status: 'pending' });
+  // brad raids: one or two — unless he's covered-for, gone, or busy being fired
+  // (the roll still spends rng so staging stays comparable across arc states)
+  const raidRoll = rand(w);
+  const raids = (flags.noBradRaids || flags.bradGone) ? 0 : 1 + (raidRoll < 0.5 ? 1 : 0);
   for(let i = 0; i < raids; i++)
     w.bradRaids.push({ atMin: 600 + Math.floor(rand(w) * 360), status: 'pending' });
   w.bradRaids.sort((a, b) => a.atMin - b.atMin);
-  // maybe a fire drill
-  if(rand(w) < CRUNCH_CHANCE)
+  // maybe a fire drill (likelier while the corner office is spiraling)
+  if(rand(w) < CRUNCH_CHANCE + (flags.crunchBoost || 0))
     w.crunch = { atMin: 690 + Math.floor(rand(w) * 120), status: 'pending' };
   return w;
 }
@@ -815,12 +1598,19 @@ function step(w, dt){
 
   w.clockMin = Math.min(1020, w.clockMin + CLOCK_SPEED * dt);
 
+  // ---- the mandatory webinar: a calendar event that eats task time ----
+  if(w.flags.webinarUntil && !w.webinarAnnounced && w.clockMin >= 540){
+    w.webinarAnnounced = true;
+    w.sig.push({ type:'webinar', until: w.flags.webinarUntil });
+  }
+  const inWebinar = w.flags.webinarUntil && w.clockMin < w.flags.webinarUntil;
+
   // ---- task drip + working at your desk ----
   while(w.tasks.spawned < w.tasks.total && w.clockMin >= w.tasks.spawnAt[w.tasks.spawned]){
     w.tasks.spawned++; w.tasks.pending++;
     w.sig.push({ type:'task', pending: w.tasks.pending });
   }
-  if(w.tasks.pending > 0 && playerAtDesk(w) && !you.path.length){
+  if(w.tasks.pending > 0 && playerAtDesk(w) && !you.path.length && !inWebinar){
     w.tasks.progress += dt / TASK_WORK_SECS;
     if(w.tasks.progress >= 1){
       w.tasks.progress = 0; w.tasks.pending--; w.tasks.done++;
@@ -838,17 +1628,20 @@ function step(w, dt){
     // already on the target tile — treat that as arrived, or the day deadlocks
     // (e.g. a card owner already adjacent never reaches 'atPlayer').
     if(a.state !== 'idle' && a.state !== 'atPlayer'){ handleArrival(w, a, you); return; }
-    if(a.state !== 'idle' || a.id === 'you') return;
+    if(a.state !== 'idle' || a.id === 'you' || a.off || a.pinned) return;
     a.wanderT -= dt;
     if(a.wanderT <= 0){
       a.wanderT = 3 + rand(w) * 8;
       const r = rand(w);
+      // Brad on two payrolls spends his idle time in the stairwell, phone out
+      const stairbound = a.id === 'brad' && w.flags.bradCalls;
       if(r < 0.30){
+        if(stairbound){ sendTo(w, a, STAIRS_SPOT, 'walking'); return; }
         const tx = a.home.x + Math.floor(rand(w) * 7) - 3;
         const ty = a.home.y + Math.floor(rand(w) * 7) - 3;
         if(isWalkable(w, tx, ty)) sendTo(w, a, { x: tx, y: ty }, 'walking');
       } else if(r < 0.42){
-        sendTo(w, a, COFFEE_SPOT, 'walking');
+        sendTo(w, a, stairbound ? STAIRS_SPOT : COFFEE_SPOT, 'walking');
       } else if(Math.abs(a.x - a.home.x) + Math.abs(a.y - a.home.y) > 0.6){
         sendTo(w, a, a.home, 'returning');
       }
@@ -878,18 +1671,66 @@ function step(w, dt){
   // ---- brad raid ----
   const brad = getActor(w, 'brad');
   w.bradRaids.forEach(br => {
-    if(br.status === 'pending' && w.clockMin >= br.atMin && brad.state === 'idle'){
+    if(br.status === 'pending' && w.clockMin >= br.atMin && brad && !brad.off && brad.state === 'idle'){
       if(sendTo(w, brad, adjacentTo(w, { x: you.home.x, y: you.home.y }), 'raid'))
         br.status = 'out';
     }
   });
 
-  // ---- the day's cards (owner walks over at the card's minute) ----
+  // ---- the deck detour: Brad walks his other job right past your desk ----
+  if(w.bradDeck && w.bradDeck.status === 'pending' && w.clockMin >= w.bradDeck.atMin
+     && brad && !brad.off
+     && (brad.state === 'idle' || brad.state === 'walking' || brad.state === 'returning')){
+    brad.path = [];
+    if(sendTo(w, brad, adjacentTo(w, { x: you.home.x, y: you.home.y }), 'deck'))
+      w.bradDeck.status = 'out';
+  }
+
+  // ---- the firing: a world event you can watch, start to door ----
+  if(w.firing && w.firing.phase !== 'done'){
+    const hr = getActor(w, 'hr');
+    if(w.firing.phase === 'wait' && w.clockMin >= 690){          // 11:30 all-hands
+      w.firing.phase = 'allhands';
+      w.sig.push({ type: 'bradallhands' });
+    } else if(w.firing.phase === 'allhands' && w.clockMin >= 720 && brad && hr){  // noon
+      brad.path = [];
+      sendTo(w, brad, brad.home, 'returning');                   // he's asked to "grab a room"
+      hr.path = [];
+      if(sendTo(w, hr, adjacentTo(w, brad.home), 'escort')) w.firing.phase = 'collect';
+    }
+  }
+
+  // ---- the quick-call summons: answer with your feet, or let it expire ----
+  if(w.summons){
+    if(w.summons.status === 'pending' && w.clockMin >= w.summons.atMin){
+      w.summons.status = 'open';
+      w.sig.push({ type: 'summons' });
+    } else if(w.summons.status === 'open' && w.clockMin >= w.summons.expireAt){
+      w.summons.status = 'missed';
+      w.sig.push({ type: 'summonsmissed' });
+    }
+  }
+
+  // ---- the human beat: crossing his path off-schedule while the arc is hot ----
+  if(w.flags.bossArcHot && !w.bossHumanDone
+     && !(w.summons && w.summons.status === 'open')
+     && !(w.playerErrand && w.playerErrand.type === 'quickcall')){
+    const bossH = getActor(w, 'boss');
+    if(bossH && bossH.state === 'idle' && !playerAtDesk(w)
+       && Math.hypot(bossH.x - you.x, bossH.y - you.y) < 2.0
+       && Math.hypot(bossH.x - bossH.home.x, bossH.y - bossH.home.y) < 2.5){
+      w.bossHumanDone = true;
+      w.sig.push({ type: 'bosshuman' });
+    }
+  }
+
+  // ---- the day's cards + arc incidents (owner walks over at the minute) ----
   if(w.nextEvent < w.events.length){
     const ev = w.events[w.nextEvent];
     if(ev.status === 'pending' && w.clockMin >= ev.atMin){
       const owner = getActor(w, ev.owner);
-      if(owner.state === 'idle' || owner.state === 'walking' || owner.state === 'returning'){
+      if(owner && !owner.off
+         && (owner.state === 'idle' || owner.state === 'walking' || owner.state === 'returning')){
         owner.path = [];
         // status advances only if the walk starts; otherwise retry next tick
         if(sendTo(w, owner, adjacentTo(w, you), 'summoned')) ev.status = 'walking';
@@ -901,7 +1742,9 @@ function step(w, dt){
         ev.status = 'active';
         w.activeEvent = ev;
         w.running = false;
-        w.sig.push({ type:'encounter', event: ev });
+        w.sig.push(ev.kind === 'incident'
+          ? { type:'arcincident', id: ev.id, event: ev }
+          : { type:'encounter', event: ev });
       }
     }
   }
@@ -922,6 +1765,47 @@ function handleArrival(w, a, you){
   else if(a.state === 'errand' && a.id === 'you'){ a.state = 'idle'; arriveErrand(w, you); }
   else if(a.state === 'patrol' && a.id === 'boss'){ bossArrives(w, a, you); }
   else if(a.state === 'raid' && a.id === 'brad'){ bradArrives(w, a, you); }
+  else if(a.state === 'deck' && a.id === 'brad'){
+    // the slip: your desk, his laptop, their logo — then he's off to the stairwell
+    if(w.bradDeck) w.bradDeck.status = 'done';
+    w.sig.push({ type: 'braddeck' });
+    if(!sendTo(w, a, STAIRS_SPOT, 'walking')) sendTo(w, a, a.home, 'returning');
+  }
+  else if(a.state === 'escort' && a.id === 'hr'){
+    const brad = getActor(w, 'brad');
+    if(!brad || brad.off){ a.state = 'idle'; }
+    else if(!brad.path.length && Math.hypot(brad.x - a.x, brad.y - a.y) <= 2.5){
+      // she has him. Both walk to the door; everyone pretends not to watch.
+      if(w.firing) w.firing.phase = 'walkout';
+      sendTo(w, brad, EXIT_SPOT, 'escorted');
+      sendTo(w, a, { x: 2, y: 17 }, 'escorting');
+    } else {
+      sendTo(w, a, adjacentTo(w, brad), 'escort');   // he moved; she follows
+    }
+  }
+  else if(a.state === 'escorting' && a.id === 'hr'){ sendTo(w, a, a.home, 'returning'); }
+  else if(a.state === 'hrvisit' && a.id === 'hr'){
+    // Meredith reaches the kitchen with her Concerned Face; Kayla is sent home
+    const kayla = getActor(w, 'kayla');
+    if(kayla && !kayla.off){
+      kayla.pinned = false; kayla.path = [];
+      sendTo(w, kayla, EXIT_SPOT, 'senthome');
+    }
+    sendTo(w, a, a.home, 'returning');
+  }
+  else if(a.state === 'senthome' && a.id === 'kayla'){
+    a.off = true; a.state = 'idle';
+    w.sig.push({ type:'kaylasenthome' });
+  }
+  else if(a.state === 'escorted' && a.id === 'brad'){
+    // through the door. Off the floor, off payroll(s), out of the raid schedule —
+    // and two of his deliverables land in your inbox before the door shuts.
+    a.off = true; a.state = 'idle';
+    if(w.firing) w.firing.phase = 'done';
+    w.sig.push({ type: 'bradfired' });
+    w.tasks.pending += 2; w.tasks.total += 2; w.tasks.spawned += 2;
+    w.sig.push({ type: 'bradtasks', pending: w.tasks.pending });
+  }
   else { a.state = 'idle'; }
 }
 
@@ -948,6 +1832,35 @@ function arriveErrand(w, you){
       sendTo(w, you, adjacentTo(w, target), 'errand');
     } else {
       w.playerErrand = null;   // they got away; no harm
+    }
+  } else if(e.type === 'kaylatask'){
+    const kayla = getActor(w, 'kayla');
+    if(!kayla || kayla.off || w.kaylaTaskTaken){ w.playerErrand = null; }
+    else if(Math.hypot(kayla.x - you.x, kayla.y - you.y) <= 2.2){
+      w.playerErrand = null;
+      w.kaylaTaskTaken = true;
+      w.tasks.pending++; w.tasks.total++; w.tasks.spawned++;   // her subplot, your stack
+      w.sig.push({ type:'kaylatask', pending: w.tasks.pending });
+    } else if(e.repaths < 3){
+      e.repaths++;
+      sendTo(w, you, adjacentTo(w, kayla), 'errand');
+    } else {
+      w.playerErrand = null;
+    }
+  } else if(e.type === 'quickcall'){
+    const boss = getActor(w, 'boss');
+    if(!w.summons || w.summons.status !== 'open'){
+      w.playerErrand = null;             // it expired while you walked; nothing here
+    } else if(Math.hypot(boss.x - you.x, boss.y - you.y) <= 2.5){
+      w.playerErrand = null;
+      w.summons.status = 'taken';
+      w.running = false;                 // the door closes; the card opens
+      w.sig.push({ type:'quickcall' });
+    } else if(e.repaths < 3){
+      e.repaths++;
+      sendTo(w, you, adjacentTo(w, boss), 'errand');
+    } else {
+      w.playerErrand = null;
     }
   }
 }
@@ -1034,6 +1947,38 @@ function goForExit(w){
   w.moveMarker = EXIT_SPOT;
   return true;
 }
+function takeKaylaTask(w){
+  if(!w.flags.kaylaPanic || w.kaylaTaskTaken) return false;
+  const kayla = getActor(w, 'kayla');
+  const you = getActor(w, 'you');
+  if(!kayla || kayla.off || !sendTo(w, you, adjacentTo(w, kayla), 'errand')) return false;
+  w.playerErrand = { type: 'kaylatask', repaths: 0 };
+  w.moveMarker = null;
+  return true;
+}
+function reportKayla(w){
+  if(!w.flags.kaylaPanic || w.kaylaReported) return false;
+  const hr = getActor(w, 'hr');
+  const kayla = getActor(w, 'kayla');
+  if(!hr || !kayla || kayla.off) return false;
+  hr.path = [];
+  if(!sendTo(w, hr, adjacentTo(w, kayla), 'hrvisit')) return false;
+  w.kaylaReported = true;
+  return true;
+}
+function goForBossCall(w){
+  if(!w.summons || w.summons.status !== 'open') return false;
+  const boss = getActor(w, 'boss');
+  const you = getActor(w, 'you');
+  if(!boss || !sendTo(w, you, adjacentTo(w, boss), 'errand')) return false;
+  w.playerErrand = { type: 'quickcall', repaths: 0 };
+  w.moveMarker = null;
+  return true;
+}
+function resolveQuickCall(w){
+  if(w.summons) w.summons.status = 'done';
+  w.running = true;
+}
 function requestChat(w, id){
   const target = getActor(w, id);
   if(!target || !target.chat || w.chatted[id]) return false;
@@ -1054,6 +1999,7 @@ function playerGoHome(w){
 function pickActorAt(w, gx, gy){
   let best = null, bestD = 0.75;
   w.actors.forEach(a => {
+    if(a.off) return;   // walked out; not clickable, not here
     const d = Math.hypot(a.x - gx, a.y - gy);
     if(d < bestD){ best = a; bestD = d; }
   });
@@ -1078,11 +2024,32 @@ function isExitAt(gx, gy){
 function statusOf(w, actor){
   if(actor.id === 'you') return { name:'You', role: actor.role, mood: null,
     line:'Tasks ship at your desk. Soul refills everywhere else. Choose.', face:'🦡', chat:false };
+  // the Brad arc shifts his status line before any card ever fires
+  if(actor.id === 'brad' && w.flags && w.flags.bradCalls){
+    return { name: actor.name, role: actor.role, mood: actor.mood, face: '📵',
+      line: '“On a call.” It is the fourth call today. None of the calls have meeting links.',
+      chat: false };
+  }
+  // Kayla's panic day: the popup carries the physical options
+  if(actor.id === 'kayla' && w.flags && w.flags.kaylaPanic && !actor.off){
+    return { name: actor.name, role: actor.role, mood: actor.mood, face: '😶‍🌫️',
+      line: '“I’m fine. It’s fine. The deck is fine.” The deck is on version 31 and she is in the kitchen.',
+      chat: !w.chatted[actor.id],           // "chat" = walk over and sit with her
+      sitWith: !w.chatted[actor.id],
+      kaylatask: !w.kaylaTaskTaken };
+  }
+  if(actor.id === 'hr' && w.flags && w.flags.kaylaPanic && !w.kaylaReported){
+    return { name: actor.name, role: actor.role, mood: actor.mood,
+      face: MOOD_FACE[actor.mood],
+      line: actor.lines ? actor.lines[actor.mood] : '',
+      chat: false, reportkayla: true };
+  }
   return {
     name: actor.name, role: actor.role, mood: actor.mood,
     face: MOOD_FACE[actor.mood],
     line: actor.lines ? actor.lines[actor.mood] : '',
-    chat: !!actor.chat && !w.chatted[actor.id]
+    chat: !!actor.chat && !w.chatted[actor.id],
+    quickcall: actor.id === 'boss' && !!(w.summons && w.summons.status === 'open')
   };
 }
 
@@ -1154,7 +2121,7 @@ function render(w, ctx, cam, vw, vh){
 
   const drawables = [];
   FURNITURE.forEach(f => drawables.push({ d: f.x + f.w / 2 + f.y + f.d / 2, f }));
-  w.actors.forEach(a => drawables.push({ d: a.x + a.y + 0.01, a }));
+  w.actors.forEach(a => { if(!a.off) drawables.push({ d: a.x + a.y + 0.01, a }); });
   drawables.sort((p, q) => p.d - q.d);
   drawables.forEach(item => {
     if(item.f) drawBox(ctx, cam, item.f, w);
@@ -1208,18 +2175,37 @@ function shade(hex, f){
 
 function drawBox(ctx, cam, f, w){
   const z = cam.z, hpx = f.h * 34 * z;
+  // Brad's desk after the walk-out: a rectangle of cleaner carpet
+  const col = (f.id === 'desk-brad' && w && w.flags && w.flags.bradGone) ? '#c9c1af' : f.color;
   const p = (gx, gy) => proj(cam, gx - 0.5, gy - 0.5);
   const [ax, ay] = p(f.x, f.y), [bx, by] = p(f.x + f.w, f.y);
   const [cx, cy] = p(f.x + f.w, f.y + f.d), [dx, dy] = p(f.x, f.y + f.d);
   ctx.beginPath(); ctx.moveTo(ax, ay - hpx); ctx.lineTo(bx, by - hpx);
   ctx.lineTo(cx, cy - hpx); ctx.lineTo(dx, dy - hpx); ctx.closePath();
-  ctx.fillStyle = f.color; ctx.fill();
+  ctx.fillStyle = col; ctx.fill();
   ctx.beginPath(); ctx.moveTo(bx, by - hpx); ctx.lineTo(cx, cy - hpx);
   ctx.lineTo(cx, cy); ctx.lineTo(bx, by); ctx.closePath();
-  ctx.fillStyle = shade(f.color, 0.72); ctx.fill();
+  ctx.fillStyle = shade(col, 0.72); ctx.fill();
   ctx.beginPath(); ctx.moveTo(dx, dy - hpx); ctx.lineTo(cx, cy - hpx);
   ctx.lineTo(cx, cy); ctx.lineTo(dx, dy); ctx.closePath();
-  ctx.fillStyle = shade(f.color, 0.55); ctx.fill();
+  ctx.fillStyle = shade(col, 0.55); ctx.fill();
+  // the second laptop: a small extra machine on Brad's desk, lid up, screen lit
+  // in a blue-white that is not this company's blue-white
+  if(f.id === 'desk-brad' && w && w.flags && w.flags.bradLaptop && !w.flags.bradGone){
+    const [lx, ly] = proj(cam, f.x + 0.35 - 0.5, f.y + 0.2 - 0.5);
+    const ty = ly - hpx;
+    ctx.fillStyle = '#22262b';                                     // base slab
+    ctx.beginPath();
+    ctx.moveTo(lx, ty - 2 * z); ctx.lineTo(lx + 9 * z, ty + 2.5 * z);
+    ctx.lineTo(lx, ty + 7 * z); ctx.lineTo(lx - 9 * z, ty + 2.5 * z);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#dfe9f5';                                     // the lit lid
+    ctx.beginPath();
+    ctx.moveTo(lx - 9 * z, ty + 2.5 * z); ctx.lineTo(lx - 9 * z, ty - 8 * z);
+    ctx.lineTo(lx, ty - 12 * z); ctx.lineTo(lx, ty - 2 * z);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#22262b'; ctx.lineWidth = 1 * z; ctx.stroke();
+  }
   // the armed EXIT glows: your number is banked, the door is live
   if(f.id === 'exit' && w && w.walkoutArmed){
     ctx.beginPath(); ctx.moveTo(ax, ay - hpx); ctx.lineTo(bx, by - hpx);
@@ -1323,11 +2309,11 @@ function drawActor(ctx, cam, a, w){
 }
 
 return {
-  GRID_W, GRID_H, TW, TH, CAST, FURNITURE, ZONES, OWNER_BY_ENC,
+  GRID_W, GRID_H, TW, TH, CAST, FURNITURE, ZONES, OWNER_BY_ENC, STAIRS_SPOT,
   TASKS_MIN, TASKS_MAX, TASK_WORK_SECS, CRUNCH_CHANCE, CLOCK_SPEED,
   setEncounters, newDay, step, resolveEncounter, resolveCrunch, eventsRemaining,
   movePlayer, goForCoffee, goForCouch, requestChat, playerGoHome, playerAtDesk,
-  armWalkout, goForExit,
+  armWalkout, goForExit, goForBossCall, resolveQuickCall, takeKaylaTask, reportKayla,
   sendTo, bfsPath, isWalkable, adjacentTo, getActor,
   pickActorAt, furnitureAt, isCoffeeAt, isCouchAt, isExitAt, statusOf, clockToMin, minToClock,
   render, proj, screenToTile
@@ -1460,6 +2446,19 @@ button{touch-action:manipulation;}
 .toast{position:absolute;bottom:52px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--panel);font-family:'Poppins',sans-serif;font-size:11.5px;border-radius:100px;padding:9px 18px;opacity:0;transition:opacity .25s;z-index:15;pointer-events:none;white-space:nowrap;}
 .toast.show{opacity:1;}
 .mute{position:absolute;bottom:12px;right:14px;z-index:6;font-size:17px;background:rgba(244,237,218,.85);border:1px solid var(--line);border-radius:100px;width:38px;height:38px;line-height:1;}
+/* the office feed: a small collapsible ticker, latest 3 lines */
+.feedbox{position:absolute;bottom:12px;left:14px;z-index:6;width:min(320px,calc(100vw - 90px));background:rgba(244,237,218,.92);border:1px solid var(--line);border-radius:12px;overflow:hidden;}
+.feedhead{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);cursor:pointer;user-select:none;}
+.feedhead b{color:var(--ink);}
+#feedlines{padding:0 12px 8px;}
+.feedbox.closed #feedlines{display:none;}
+.fline{font-size:11.5px;line-height:1.45;color:#3a352a;padding:3px 0;border-top:1px dashed var(--line);}
+.fline:first-child{border-top:none;}
+.fline .ft{font-family:'Poppins',sans-serif;font-size:9px;color:var(--muted2);margin-right:6px;}
+/* full-day log on the 5:01 report */
+.feedlog{margin:2px 0 16px;border:1px solid var(--line);border-radius:10px;padding:8px 12px;background:var(--panel2);}
+.feedlog summary{font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);cursor:pointer;}
+.feedlog .fline{font-size:12px;}
 /* fire drill */
 .crunchcard .tag{color:var(--danger);border-color:var(--danger);}
 .crunchbar{height:14px;background:var(--panel3);border-radius:100px;overflow:hidden;margin:6px 0 8px;}
@@ -1497,7 +2496,7 @@ button{touch-action:manipulation;}
 
   <!-- START -->
   <section id="start" class="screen">
-    <div class="mascot"><img src="assets/mascot.png" alt="Nine to Survive" onerror="this.style.display='none';this.nextElementSibling.style.display='block'"><span class="fallback" style="display:none">🤷</span></div>
+    <div class="mascot"><img src="data:image/png;base64,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" alt="Nine to Survive" onerror="this.style.display='none';this.nextElementSibling.style.display='block'"><span class="fallback" style="display:none">🤷</span></div>
     <div class="badge">Nine to Survive presents</div>
     <h1 class="big">Your <span class="blue">Num</span><span class="amber">ber</span></h1>
     <div class="tagline">Bank $3,100. Keep your soul. Walk out.</div>
@@ -1523,6 +2522,7 @@ button{touch-action:manipulation;}
       </div>
       <div class="jobline"><span id="jobline-l">Day 1 · Wk 1 · Intern</span><span class="pay" id="jobline-r">+$180/day</span></div>
       <div class="jobline taskline"><span id="tasks-l">INBOX · 0 waiting</span><span id="tasks-r">0/0 shipped</span></div>
+      <div class="jobline taskline hidden" id="receiptline"><span>🧾 Receipts</span><span id="receipts-r"></span></div>
       <div class="meters">
         <div class="meter standing">
           <div class="mrow"><div><span class="mname">Standing</span> <span class="msub">how they see you</span></div><div class="mval" id="v-standing">50<span class="delta" id="d-standing"></span></div></div>
@@ -1541,6 +2541,10 @@ button{touch-action:manipulation;}
 
     <div class="hint">Click the floor to walk · Work happens AT your desk · Watch for ❗ · Coffee/couch/chats refill Soul</div>
     <button id="mutebtn" class="mute" onclick="toggleMute()">🔊</button>
+    <div id="feedbox" class="feedbox">
+      <div class="feedhead" onclick="toggleFeed()"><span><b>#office</b> · live</span><span id="feedcaret">▾</span></div>
+      <div id="feedlines"></div>
+    </div>
     <div id="statuspop" class="statuspop hidden"></div>
     <div id="toast" class="toast"></div>
 
@@ -1578,6 +2582,7 @@ button{touch-action:manipulation;}
       <div class="tag" id="detag">5:01 PM · Day 1</div>
       <div class="etitle" id="detitle">Day 1: survived.</div>
       <div class="report" id="report"></div>
+      <div id="dayfeed"></div>
       <div class="bankline" id="bankline"></div>
       <button class="walkout hidden" id="walkoutbtn" onclick="doWalkOut()">Walk out — you have your number</button>
       <button class="next" id="clockinbtn" onclick="clockIn()">Clock in — Day 2</button>
@@ -1744,7 +2749,10 @@ function showStatus(actor, sx, sy){
     + '<div class="sname">' + (s.face ? s.face + ' ' : '') + s.name + '</div>'
     + '<div class="srole">' + s.role + (s.mood ? ' · mood: ' + s.mood : '') + '</div>'
     + '<div class="sline">' + s.line + '</div>'
-    + (s.chat ? '<span class="schat" onclick="startChat(\'' + actor.id + '\')">Walk over & chat</span>' : '');
+    + (s.chat ? '<span class="schat" onclick="startChat(\'' + actor.id + '\')">' + (s.sitWith ? 'Walk over & sit with her' : 'Walk over & chat') + '</span>' : '')
+    + (s.quickcall ? '<span class="schat" onclick="startQuickCall()">Take the quick call</span>' : '')
+    + (s.kaylatask ? '<span class="schat" onclick="takeKaylaTask()">Take one of her tasks</span>' : '')
+    + (s.reportkayla ? '<span class="schat" onclick="reportKaylaToHR()">Mention Kayla to HR</span>' : '');
   pop.classList.remove('hidden');
   pop.style.left = Math.min(window.innerWidth - 260, sx + 14) + 'px';
   pop.style.top = Math.min(window.innerHeight - 150, Math.max(10, sy - 40)) + 'px';
@@ -1753,6 +2761,41 @@ function hideStatus(){ $id('statuspop').classList.add('hidden'); }
 function startChat(id){
   hideStatus();
   if(W.requestChat(world, id)) toast('Walking over…');
+}
+function startQuickCall(){
+  hideStatus();
+  if(W.goForBossCall(world)) toast('Walking to the corner office. Bring a face.');
+}
+function takeKaylaTask(){
+  hideStatus();
+  if(W.takeKaylaTask(world)) toast('Walking over to lighten her stack…');
+}
+function reportKaylaToHR(){
+  hideStatus();
+  if(W.reportKayla(world)) toast('You mention it to Meredith. Gently. Meaning well. Watch.');
+}
+
+/* ---- the office feed (render only — the brain writes g.feed) ---- */
+let feedShown = 0;
+let feedClosed = false;
+try { feedClosed = localStorage.getItem('ntos-feed-closed') === '1'; } catch(e){}
+function toggleFeed(){
+  feedClosed = !feedClosed;
+  try { localStorage.setItem('ntos-feed-closed', feedClosed ? '1' : '0'); } catch(e){}
+  applyFeedCollapse();
+}
+function applyFeedCollapse(){
+  $id('feedbox').classList.toggle('closed', feedClosed);
+  $id('feedcaret').textContent = feedClosed ? '▸' : '▾';
+}
+applyFeedCollapse();
+function feedLineHtml(f){
+  return '<div class="fline"><span class="ft">' + W.minToClock(f.m) + '</span>' + f.text + '</div>';
+}
+function renderFeed(){
+  feedShown = g.feed.length;
+  $id('feedlines').innerHTML = g.feed.slice(-3).map(feedLineHtml).join('')
+    || '<div class="fline">No messages. Suspicious in itself.</div>';
 }
 
 let toastT = null, deadEyedToastDay = 0;
@@ -1836,7 +2879,7 @@ function startGame(){
 }
 
 function beginDay(){
-  world = W.newDay(runSeed, g.day, g.plan);
+  world = W.newDay(runSeed, g.day, g.plan, G.worldFlagsFor(g));
   window.g = g; window.world = world;   // console debugging
   screens('play');
   fitCanvas();
@@ -1847,6 +2890,8 @@ function beginDay(){
   setMoney(true);
   updateJobline();
   hideStatus();
+  G.moodFeed(g, world.actors.map(a => ({ id: a.id, mood: a.mood })));
+  renderFeed();
   if(G.canWalkOut(g)){
     W.armWalkout(world);
     toast('Your number is banked. The EXIT is right there. Any time.');
@@ -1871,6 +2916,10 @@ function loop(t){
   })();
   $id('tasks-l').textContent = 'INBOX · ' + world.tasks.pending + ' waiting';
   $id('tasks-r').textContent = world.tasks.done + '/' + world.tasks.total + ' shipped';
+  if(g.feed.length !== feedShown) renderFeed();
+  const rc = g.receipts ? g.receipts.count : 0;
+  $id('receiptline').classList.toggle('hidden', rc === 0);
+  if(rc > 0) $id('receipts-r').textContent = rc + ' held · leverage, technically';
   W.render(world, ctx, cam, window.innerWidth, window.innerHeight);
   rafId = requestAnimationFrame(loop);
 }
@@ -1890,7 +2939,59 @@ function worldEffect(kind){
 function handleSignal(s){
   switch(s.type){
     case 'encounter': openCard(); break;
+    case 'arcincident': openIncident(s.id); break;
     case 'crunch': openCrunch(); break;
+    case 'braddeck':
+      G.bradDeckSeen(g, Math.floor(world.clockMin));
+      toast('Brad hustles past your desk mid-call. On his screen: a slide deck. The logo on it: not ours.');
+      break;
+    case 'bradallhands':
+      G.bradAllHands(g, Math.floor(world.clockMin));
+      SFX.drill();
+      toast('❗ All-hands: Brad’s Zoom background is a conference room at the WRONG COMPANY.');
+      break;
+    case 'bradfired':
+      G.bradFiredReport(g, Math.floor(world.clockMin));
+      toast('Meredith just walked Brad out the door. Carrying his box for him. Policy.');
+      break;
+    case 'bradtasks':
+      G.bradTasksAbsorbed(g, Math.floor(world.clockMin));
+      toast('Two of Brad’s tasks land in YOUR inbox. “Congratulations on the growth opportunity.”');
+      break;
+    case 'summons':
+      G.feedWorldEvent(g, 'summons', Math.floor(world.clockMin));
+      toast('The Boss: “you free? quick call.” No topic. Click him to go — or don’t.');
+      break;
+    case 'summonsmissed':
+      if(G.bossSummonsDodged(g, Math.floor(world.clockMin)))
+        toast('The quick call expired unanswered. His next catches will not be quick.');
+      break;
+    case 'quickcall':
+      openIncident('boss_quick_call');
+      break;
+    case 'kaylatask': {
+      const kt = G.kaylaTaskTaken(g, Math.floor(world.clockMin));
+      if(kt){ setMeter('soul', g.soul); toast(kt.text); }
+      W.playerGoHome(world);
+      break;
+    }
+    case 'kaylasenthome': {
+      const kr = G.kaylaSentHome(g, Math.floor(world.clockMin));
+      if(kr){ setMeter('standing', g.standing); applyDelta('standing', kr.ds); toast(kr.text); }
+      break;
+    }
+    case 'webinar':
+      SFX.drill();
+      toast('MANDATORY: “Resilience & You,” 90 min, cameras expected. Your inbox will wait. It will not shrink.');
+      break;
+    case 'bosshuman': {
+      const line = G.bossHumanBeat(g, Math.floor(world.clockMin));
+      if(line){
+        const res = worldEffect('bossHuman');
+        toast(line + (res && res.dso ? ' Soul +' + res.dso + '.' : ''));
+      }
+      break;
+    }
     case 'task':
       toast('New task in your inbox. (' + s.pending + ' waiting)'); break;
     case 'taskdone': {
@@ -1915,6 +3016,7 @@ function handleSignal(s){
       break;
     case 'bosscatch':
       worldEffect(s.bad ? 'bossCatchBad' : 'bossCatch');
+      if(s.bad) G.feedWorldEvent(g, 'bossCatchBad', Math.floor(world.clockMin));
       SFX.bosscatch();
       toast(s.bad
         ? '“WHERE were you?” Wrong day for an empty chair. Standing −9.'
@@ -1922,6 +3024,7 @@ function handleSignal(s){
       break;
     case 'bradsteal':
       worldEffect('bradSteal');
+      G.feedWorldEvent(g, 'bradSteal', Math.floor(world.clockMin));
       toast('Brad lifted a file off your empty desk. That task is his now. Standing −3.');
       break;
     case 'bradfoiled':
@@ -1935,14 +3038,35 @@ function handleSignal(s){
       doWalkOut();
       break;
     case 'chat': {
+      if(s.who === 'kayla' && world.flags.kaylaPanic){
+        const sit = G.kaylaSitWith(g, Math.floor(world.clockMin));
+        if(sit){
+          setMeter('soul', g.soul); applyDelta('soul', sit.dso);
+          toast(sit.text);
+          W.playerGoHome(world);
+          break;
+        }
+      }
       const kind = s.mood === 'good' ? 'chatGood' : s.mood === 'bad' ? 'chatBad' : 'chatMeh';
       const res = worldEffect(kind);
-      toast(s.name.split(' ')[0] + ': five minutes of being human. Soul +' + (res ? res.dso : ''));
+      const bond = G.chatBonus(g, s.who);
+      if(bond){ setMeter('soul', g.soul); }
+      const tip = s.who === 'marcus' ? G.marcusTip(g, Math.floor(world.clockMin)) : null;
+      if(tip){
+        if(tip.kind === 'miscal'){ setMeter('standing', g.standing); applyDelta('standing', -2); }
+        if(tip.kind === 'bosswalk'){
+          const nw = world.bossWalks.find(b => b.status === 'pending');
+          toast(tip.text + (nw ? ' (Next walk ≈ ' + W.minToClock(nw.atMin) + '.)' : ' (He’s done walking today.)'));
+        } else toast(tip.text);
+      } else {
+        toast(s.name.split(' ')[0] + ': five minutes of being human. Soul +' + (res ? res.dso : ''));
+      }
       W.playerGoHome(world);
       break;
     }
     case 'couch':
       worldEffect('couch');
+      G.feedWorldEvent(g, 'couch', Math.floor(world.clockMin));
       toast('Couch. Soul +6. Someone from HR definitely saw. Standing −1.');
       break;
     case 'coffee': {
@@ -2015,7 +3139,8 @@ if(MOVIE){
     }
     if(!$id('cardoverlay').classList.contains('hidden')){
       if(!$id('enc').classList.contains('hidden')){
-        const c = document.querySelector('#choices .choice[data-idx="2"]');
+        const c = document.querySelector('#choices .choice[data-idx="2"]')
+               || document.querySelector('#choices .choice');   // 2-choice incidents
         if(c) c.click();
       } else {
         $id('nextbtn').click();
@@ -2094,6 +3219,60 @@ function openCard(){
     b.onclick = () => choose(idx);
     box.appendChild(b);
   });
+  // receipts can unlock an extra play (e.g. the screenshot vs. Credit Reassigned)
+  G.extraChoicesFor(g, g.plan[g.idxInDay]).forEach(x => {
+    const b = document.createElement('button');
+    b.className = 'choice';
+    b.style.borderColor = 'var(--danger)';
+    b.textContent = '🧾 ' + x.t;
+    b.dataset.key = x.key;
+    b.onclick = () => chooseExtra(x.key);
+    box.appendChild(b);
+  });
+}
+
+function chooseExtra(key){
+  const res = G.applyExtraChoice(g, g.plan[g.idxInDay], key, Math.floor(world.clockMin));
+  if(!res) return;
+  applyDelta('standing', res.ds);
+  applyDelta('soul', res.dso);
+  $id('enc').classList.add('hidden');
+  $id('out').classList.remove('hidden');
+  $id('oline').textContent = res.outcome;
+  $id('nextbtn').textContent = g.failed ? 'See how it ends' : 'Back to your desk';
+}
+
+/* ---- arc incident cards (story moments the arcs staged; not deck cards) ---- */
+let activeIncident = null;
+function openIncident(id){
+  hideStatus();
+  const def = G.ARC_INCIDENTS[id];
+  if(!def){ W.resolveEncounter(world); return; }   // unknown id: never strand the day
+  activeIncident = id;
+  $id('cardoverlay').classList.remove('hidden');
+  $id('enc').classList.remove('hidden');
+  $id('out').classList.add('hidden');
+  $id('tag').textContent = def.tag;
+  $id('etitle').textContent = def.title;
+  $id('escene').textContent = def.scene;
+  const box = $id('choices'); box.innerHTML = '';
+  def.choices.forEach((c, i) => {
+    const b = document.createElement('button');
+    b.className = 'choice'; b.textContent = c.t;
+    b.dataset.idx = i;                 // movie-mode autopilot picks by data-idx
+    b.onclick = () => chooseIncident(i);
+    box.appendChild(b);
+  });
+}
+function chooseIncident(i){
+  const res = G.applyIncidentChoice(g, activeIncident, i, Math.floor(world.clockMin));
+  if(!res) return;
+  applyDelta('standing', res.ds);
+  applyDelta('soul', res.dso);
+  $id('enc').classList.add('hidden');
+  $id('out').classList.remove('hidden');
+  $id('oline').textContent = res.outcome;
+  $id('nextbtn').textContent = g.failed ? 'See how it ends' : 'Back to your desk';
 }
 
 function choose(i){
@@ -2109,6 +3288,15 @@ function choose(i){
 
 function advance(){
   $id('cardoverlay').classList.add('hidden');
+  if(activeIncident){
+    const wasQuickCall = activeIncident === 'boss_quick_call' && !world.activeEvent;
+    activeIncident = null;           // incident cards don't advance the deck index
+    if(g.failed) return endGame();
+    if(wasQuickCall){ W.resolveQuickCall(world); W.playerGoHome(world); }
+    else W.resolveEncounter(world);
+    saveRun('day');
+    return;
+  }
   const r = G.advance(g);
   if(r === 'gameover') return endGame();
   W.resolveEncounter(world);
@@ -2120,6 +3308,7 @@ const CRUNCH_CLICKS = 12, CRUNCH_SECS = 8;
 let crunchState = null;
 function openCrunch(){
   hideStatus();
+  G.feedWorldEvent(g, 'crunch', Math.floor(world.clockMin));
   SFX.drill();
   crunchState = { clicks: 0, deadline: performance.now() + CRUNCH_SECS * 1000, done: false };
   $id('crunchmodal').classList.remove('hidden');
@@ -2171,22 +3360,31 @@ function showDayEnd(){
   const rep = g.dayReport;
   screens('dayend');
   $id('detag').textContent = '5:01 PM · Day ' + rep.day + (rep.day % 5 === 0 ? ' · Friday review' : '');
-  $id('detitle').textContent = 'Day ' + rep.day + ': survived.';
+  $id('detitle').textContent = G.dayHeadline(g);
   const rows = [
+    ['🏆 Award: ' + G.dayAward(g), 'accepted on your behalf', 'big'],
     ['Tasks shipped', rep.tasksDone + ' / ' + rep.tasksTotal, rep.tasksDone >= rep.tasksTotal ? 'plus' : 'minus'],
     ['“What have you done for them lately”', 'Standing −' + rep.decay, 'minus'],
     ['Pay — ' + rep.title, '+' + G.fmt(rep.pay), 'plus'],
     ['Cost of living — week ' + rep.week, '−' + G.fmt(rep.burn), 'minus'],
     ['The grind', 'Soul −' + rep.drain, 'soulhit']
   ];
-  if(rep.missed) rows.splice(1, 0, ['Died in the inbox (' + rep.missed + ')', 'Standing −' + rep.missed * G.TASK_MISS_S, 'minus']);
+  if(rep.missed) rows.splice(2, 0, ['Died in the inbox (' + rep.missed + ')', 'Standing −' + rep.missed * G.TASK_MISS_S, 'minus']);
+  if(rep.forgiven) rows.push(['Marcus was right — nobody read it before Thursday', 'one missed task forgiven', 'plus']);
+  if(rep.watchedKayla) rows.push(['You kept your head down. It stayed down.', 'Soul −' + G.WATCHED_SOUL, 'soulhit']);
   if(rep.deadEyed) rows.push(['Dead-eyed productivity — ' + rep.deadEyed + ' task' + (rep.deadEyed > 1 ? 's' : '') + ' shipped without looking up', 'Soul −' + rep.deadEyed * G.GRIND_SOUL + ' (already billed)', 'soulhit']);
   if(rep.broke) rows.push(['Overdraft. The fear at the ATM.', 'Soul −' + G.BROKE_SOUL, 'soulhit']);
   if(rep.promoted) rows.push(['PROMOTED → ' + rep.newTitle, 'Standing → ' + G.PROMOTE_RESET + ' · Soul −' + G.PROMOTE_SOUL, 'big']);
+  if(rep.truthBill) rows.push(['Your “anonymous” answers attended the review', 'Standing −5', 'minus']);
+  if(rep.warningDefused) rows.push(['Warning withdrawn — you mentioned response IDs', '🧾 receipt spent', 'plus']);
   if(rep.warned) rows.push(['HR “quick chat” — the word PIP was used', 'Soul −' + G.WARN_SOUL, 'soulhit']);
   $id('report').innerHTML = rows.map(r =>
     '<div class="rrow"><span class="rk">' + r[0] + '</span><span class="rv ' + r[2] + '">' + r[1] + '</span></div>'
   ).join('');
+  $id('dayfeed').innerHTML = g.feed.length
+    ? '<details class="feedlog"><summary>#office — today’s full log (' + g.feed.length + ')</summary>'
+      + g.feed.map(feedLineHtml).join('') + '</details>'
+    : '';
   $id('bankline').innerHTML = 'Banked: <b>' + G.fmt(g.money) + '</b> / your number: ' + G.fmt(G.FU_TARGET);
   $id('walkoutbtn').classList.toggle('hidden', !G.canWalkOut(g));
   $id('clockinbtn').textContent = G.canWalkOut(g) ? 'One more day (greed)' : 'Clock in — Day ' + (g.day + 1);
@@ -2202,24 +3400,10 @@ function doWalkOut(){
   if(G.walkOut(g)) endGame();
 }
 
-/* ---- share card: plain text to the clipboard, receipts included ---- */
-function shareFlavor(){
-  const s = g.stats || {};
-  if(s.bradSteals > 0) return 'Brad stole ' + s.bradSteals + ' of my files and presented them as growth.';
-  if(s.crunchWins > 0) return 'Survived ' + s.crunchWins + ' fire drill' + (s.crunchWins > 1 ? 's' : '') + ' without learning anything.';
-  if(s.warnings > 0) return s.warnings + ' formal warning' + (s.warnings > 1 ? 's' : '') + ', zero formal changes.';
-  if(s.crunchFails > 0) return 'Missed ' + s.crunchFails + ' fire-drill deadline' + (s.crunchFails > 1 ? 's' : '') + '. The room saw.';
-  return 'An unremarkable tenure, which was the plan.';
-}
+/* ---- share card: plain text to the clipboard. The brain writes the story
+   (G.shareText leads with the run's best real incident); the shell only copies. ---- */
 function shareRun(btn){
-  const headline = g.over ? G.verdict(g).title : 'Still there. Still counting.';
-  const text = [
-    'NINE TO SURVIVE — YOUR NUMBER',
-    'Day ' + g.day + ' · ' + headline,
-    'Banked ' + G.fmt(g.money) + ' / ' + G.fmt(G.FU_TARGET) + ' · Standing ' + g.standing + ' · Soul ' + g.soul,
-    shareFlavor(),
-    'Ungovernable. Unapologetic.'
-  ].join('\n');
+  const text = G.shareText(g);
   const done = () => {
     const old = btn.textContent;
     btn.textContent = 'Copied.';
