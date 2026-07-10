@@ -242,6 +242,12 @@ const NineToSurvive = (() => {
   ];
 
   const clamp = (v) => Math.max(0, Math.min(100, v));
+  // Above SOUL_COMFORT, Soul gains halve (round up): contentment attracts
+  // meetings. Only shaves surplus — nobody struggling ever feels it.
+  const SOUL_COMFORT = 70;
+  function temperSoulGain(g, dso){
+    return (dso > 0 && g.soul >= SOUL_COMFORT) ? Math.ceil(dso / 2) : dso;
+  }
   const fmt = (n) => '$' + String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
   // ---- The career ------------------------------------------------------------
@@ -261,7 +267,7 @@ const NineToSurvive = (() => {
   const BURN_STEP      = 25;    // lifestyle creep: burn rises this much per week
   const PROMOTE_AT     = 68;    // standing needed at the Friday review
   const PROMOTE_RESET  = 55;    // "the bar moves": standing after a promotion
-  const PROMOTE_SOUL   = 5;     // what each rung costs you
+  const PROMOTE_SOUL   = 9;     // what each rung costs you (Session 9: the bar bites)
   const WARN_AT        = 35;    // below this at review = formal warning
   const WARN_SOUL      = 4;     // the dread
   const BROKE_SOUL     = 6;     // overdraft anxiety when pay can't cover the burn
@@ -344,11 +350,37 @@ const NineToSurvive = (() => {
   // The office lore layer: everyone you work with carries persistent state now.
   // stress/trust move with incidents; flags hold arc secrets; counters feed
   // headlines and share copy. All plain data — it rides the existing save.
-  const NPC_IDS = ['brad', 'boss', 'meredith', 'dennis', 'kayla', 'marcus', 'priya'];
+  const NPC_IDS = ['brad', 'boss', 'meredith', 'dennis', 'kayla', 'marcus', 'priya', 'adam'];
   function freshNpcState(){
     const st = {};
     NPC_IDS.forEach(id => { st[id] = { stress: 0, trust: 0, arcStage: 0, flags: {}, counters: {} }; });
     return st;
+  }
+
+  // Which storylines does THIS run get? Seeded selection of 2–3 from the story
+  // pool (weighted so Brad's scandal doesn't headline nearly every run); Marcus
+  // is the mentor, not a storyline, and is always on. Inactive arcs stay fully
+  // dormant: no clues, no stages, no incidents, no feed lines.
+  const ARC_POOL = [
+    { key: 'brad_second_job', wt: 0.5 },   // the scandal headlines a minority of runs
+    { key: 'boss_spiral', wt: 1 },
+    { key: 'hr_survey', wt: 1 },
+    { key: 'kayla_presentation', wt: 1 },
+    { key: 'priya_credit', wt: 1 }
+  ];
+  function pickArcs(runSeed){
+    const r = localRand((runSeed ^ hashStr('arc_select')) | 0);
+    const count = 2 + (r() < 0.5 ? 1 : 0);
+    const active = { marcus_survivor: true };
+    const cands = ARC_POOL.slice();
+    for(let i = 0; i < count && cands.length; i++){
+      const total = cands.reduce((s, c) => s + c.wt, 0);
+      let roll = r() * total, idx = 0;
+      while(idx < cands.length - 1 && roll > cands[idx].wt){ roll -= cands[idx].wt; idx++; }
+      active[cands[idx].key] = true;
+      cands.splice(idx, 1);
+    }
+    return active;
   }
 
   // Fresh career. Day 1, Intern, seeded plan for the first day.
@@ -363,12 +395,14 @@ const NineToSurvive = (() => {
       taskStreak: 0, deadEyedToday: 0,
       npcState: freshNpcState(),
       arcs: {},              // per-arc runtime state, keyed by ARCS name — pure data
+      activeArcs: pickArcs((seed == null ? 1 : seed) | 0),   // this run's storylines
       todayIncidents: [],    // [{id, owner, atMin}] the arcs staged for today
       receipts: { count: 0, flags: {} },
       feed: [],              // today's office feed: [{m: clockMin, text}]
       runSeed: (seed == null ? 1 : seed) | 0,
       rngState: (seed == null ? 1 : seed) | 0
     };
+    g.dennisBlockerToday = arcRand(g, 'dennis', 'blocker')() < 0.25;
     g.plan = planDay(g);
     return g;
   }
@@ -385,7 +419,7 @@ const NineToSurvive = (() => {
     if(!c) return null;
     const before = { standing: g.standing, soul: g.soul };
     g.standing = clamp(g.standing + c.s);
-    g.soul     = clamp(g.soul + c.so);
+    g.soul     = clamp(g.soul + temperSoulGain(g, c.so));
     // fail states: either meter bottoming out ends the day early
     if(g.standing <= 0){ g.failed = 'standing'; g.over = true; }
     else if(g.soul <= 0){ g.failed = 'soul'; g.over = true; }
@@ -414,12 +448,13 @@ const NineToSurvive = (() => {
     bossCatchBad:{ s:-9, so:-2 },  // ...on one of his bad days
     bradSteal:  { s:-3, so:-2 },   // your work is his work now
     bradFoiled: { s:+1, so:+1 },   // he hovered; you were sitting right there
-    chatGood:   { s: 0, so:+5 },   // five minutes of being human
-    chatMeh:    { s: 0, so:+3 },
+    chatGood:   { s: 0, so:+3 },   // five minutes of being human
+    chatMeh:    { s: 0, so:+2 },
     chatBad:    { s: 0, so:+2 },   // you listened to them vent; still counts
-    couch:      { s:-1, so:+6 },   // seen lounging; worth it
+    couch:      { s:-1, so:+3 },   // seen lounging; worth it, barely
     coffee:     { s: 0, so:+2 },
-    bossHuman:  { s: 0, so:+2 }    // he was, briefly, a person
+    bossHuman:  { s: 0, so:+2 },   // he was, briefly, a person
+    dennisFlatter: { s: 0, so:-2 } // "nineteen years, wow" — it costs you to say it
   };
   // The Boss-spiral trap, priced: his confidant gets softer catches; the one
   // who deflected gets harder ones — for the arc's duration only (the arc
@@ -443,7 +478,7 @@ const NineToSurvive = (() => {
     const sMod = (kind === 'bossCatch' || kind === 'bossCatchBad')
       ? bossCatchMod(g) + consumeCatchShield(g) : 0;
     g.standing = clamp(g.standing + (e.s || 0) + sMod);
-    g.soul     = clamp(g.soul + (e.so || 0));
+    g.soul     = clamp(g.soul + temperSoulGain(g, e.so || 0));
     let deadEyed = false;
     if(kind === 'taskDone'){
       g.taskStreak = (g.taskStreak || 0) + 1;
@@ -479,7 +514,10 @@ const NineToSurvive = (() => {
     'priya|meh':     'Priya booked a focus block. Three people booked over it.',
     'kayla|good':    'Kayla has been smiling at her phone all morning. Nobody asks. Everybody knows.',
     'marcus|good':   'Marcus reacted with the eyes emoji to the all-hands invite.',
-    'brad|good':     'Brad posted “thrilled to share” at 9:04 AM.'
+    'brad|good':     'Brad posted “thrilled to share” at 9:04 AM.',
+    'adam|good':     'Adam cc’d himself.',
+    'adam|meh':      'Adam replied-all to ask who approved this.',
+    'adam|bad':      'Kayla told Adam to stay in his lane. Adam scheduled a follow-up about lanes.'
   };
   function moodFeed(g, moods){
     if(g.feedMoodDay === g.day) return false;   // once per morning, resume-safe
@@ -576,12 +614,14 @@ const NineToSurvive = (() => {
           g.todayIncidents.push({ id: 'brad_discovery', owner: 'brad',
             atMin: 620 + Math.floor(arcRand(g, 'brad', 'discovery')() * 250) });
         } else if(a.stage === 5){
-          // exposed and unreported: some mornings, payroll does the math
+          // exposed and unreported: some mornings, payroll does the math —
+          // and some runs, the moment genuinely passes (holding the screenshot
+          // unspent is its own story)
           a.waited = (a.waited || 0) + 1;
-          if(arcRand(g, 'brad', 'fired')() < 0.5){
+          if(arcRand(g, 'brad', 'fired')() < 0.4){
             a.stage = 6; brad.stress = 3;
             pushFeed(g, 540, 'All-hands moved to 11:30. “Please plan to attend.” Nobody plans to attend. Everybody attends.');
-          } else if(a.waited >= 3){
+          } else if(a.waited >= 2){
             a.stage = 8;
             pushFeed(g, 540, 'Brad archived a channel nobody knew existed. The moment passed. Somehow the moment passed.');
           }
@@ -669,6 +709,52 @@ const NineToSurvive = (() => {
       }
     },
 
+    // PRIYA BUILT THE THING. Six late nights of visible grind, then Brad demos
+    // it and the Boss thanks "the team." Stages: 0 dormant · 1 the build (two
+    // days, feed notices, she doesn't leave her desk) · 2 demo day (the card) ·
+    // 3 aftermath · 4 filed. If Brad is already out of play, the Boss presents
+    // it himself — credit rolls uphill either way.
+    priya_credit: {
+      npc: 'priya',
+      advance(g, a){
+        const priya = g.npcState.priya;
+        if(a.stage === 0){
+          if(a.startDay == null)
+            a.startDay = 4 + Math.floor(localRand((g.runSeed ^ hashStr('priya_start')) | 0)() * 4);
+          if(g.day >= a.startDay){
+            a.stage = 1; priya.stress = 2;
+            pushFeed(g, 547, 'Priya’s commit history has no gaps this week. Including the 2 AMs.');
+          }
+        } else if(a.stage === 1){
+          if(g.day >= a.startDay + 2){
+            a.stage = 2;
+            a.presenter = bradOutOfPlay(g) ? 'boss' : 'brad';
+            pushFeed(g, 542, 'Demo at 2:00. Presenter: ' + (a.presenter === 'brad' ? 'Brad' : 'the Boss')
+              + '. Builder: not the presenter.');
+            g.todayIncidents.push({ id: 'priya_demo', owner: a.presenter,
+              atMin: 780 + Math.floor(arcRand(g, 'priya', 'demo')() * 120) });
+          } else {
+            pushFeed(g, 552, 'Priya declined two meetings. The thing is almost the thing.');
+          }
+        } else if(a.stage === 2){
+          if(!priya.counters.demoDay){
+            // unanswered somehow: the demo re-runs (nothing strands)
+            g.todayIncidents.push({ id: 'priya_demo', owner: a.presenter || 'brad',
+              atMin: 780 + Math.floor(arcRand(g, 'priya', 'demo')() * 120) });
+          } else {
+            a.stage = 3;
+            pushFeed(g, 544, 'The Boss thanked “the team” for the dashboard. The team checked its one-person Slack channel and said nothing.');
+            if(priya.flags.backed)
+              pushFeed(g, 560, 'Someone renamed the dashboard file to include a byline. IT did not object.');
+            else if(priya.flags.baitWon)
+              pushFeed(g, 560, 'Slide four is now a teaching moment. Attendance at the retro is mandatory.');
+          }
+        } else if(a.stage === 3){
+          a.stage = 4;
+        }
+      }
+    },
+
     // THE ANONYMOUS SURVEY IS NOT. Meredith launches a Pulse Survey; the next
     // day she starts identifying authors, for culture. Stages: 0 dormant ·
     // 1 survey day (the card comes) · 2 the hunt · 3 filed. The comedy target
@@ -726,6 +812,8 @@ const NineToSurvive = (() => {
   function advanceArcs(g){
     if(!g.arcs) g.arcs = {};
     Object.keys(ARCS).sort().forEach(key => {
+      // arcs this run didn't draw stay fully dormant (old saves: all active)
+      if(g.activeArcs && !g.activeArcs[key]) return;
       if(!g.arcs[key]) g.arcs[key] = { stage: 0 };
       ARCS[key].advance(g, g.arcs[key]);
       const npc = g.npcState[ARCS[key].npc];
@@ -748,6 +836,23 @@ const NineToSurvive = (() => {
           o:'He slams the lid and looks at you the way drowning men look at driftwood. “You’re solid,” he whispers. Complicit. The word is complicit. Your inbox, at least, is now a protected wetland.' },
         { key:'ride', t:'See nothing. Sip your coffee. Let it ride.', s:0, so:+1,
           o:'You turn back to your monitor and let the universe keep its own books. Whatever happens to Brad now was always going to happen. You are merely no longer load-bearing.' }
+      ]
+    },
+    priya_demo: {
+      tag: 'Incident · The Demo',
+      title: 'Built by Priya. Presented by Someone Else.',
+      scene: 'The dashboard Priya built across six late nights is on the big screen, driven with the confidence of authorship by someone who did not author it. “Something I’ve been noodling on,” he says. Priya is in the second row, holding a coffee she isn’t drinking. The commit log is one tab away. Everyone can see the screen. Only you are looking at her.',
+      choices: [
+        { key:'back', t:'“Quick context — this is Priya’s build. She should walk us through it.”', s:-3, so:+5,
+          o:'The room recalibrates. “Obviously a team effort,” the presenter says, at a volume that means it wasn’t. Priya walks the room through it in nine flawless minutes, and something in the org chart shifts a millimeter.' },
+        { key:'dm', t:'DM her: “Everyone knows. For what it’s worth.”', s:0, so:+3,
+          o:'“ha. thanks.” Two seconds later: “it’s fine.” It is not fine, and you have contributed one (1) grape to the fineness. Still — witnessed beats invisible.' },
+        { key:'collect', t:'Screenshot the commit log. Every line has her name on it.', s:0, so:+1,
+          o:'Authorship, timestamped, saved. You fixed nothing today. You made it fixable.' },
+        { key:'slide', t:'Let it slide. The demo is going great.', s:+1, so:-4,
+          o:'The demo lands. The presenter bows at the neck. Priya closes her laptop with two hands, quietly, like it’s a casket. Your monitor is suddenly fascinating.' },
+        { key:'bait', t:'Swap in the flawed backup file before the demo starts.', s:0, so:0,
+          o:'(the swap goes in)' }
       ]
     },
     hr_survey: {
@@ -783,7 +888,7 @@ const NineToSurvive = (() => {
   function applyStoryDelta(g, s, so){
     const b = { s: g.standing, so: g.soul };
     g.standing = clamp(g.standing + (s || 0));
-    g.soul     = clamp(g.soul + (so || 0));
+    g.soul     = clamp(g.soul + temperSoulGain(g, so || 0));
     if(g.standing <= 0 && !g.failed){ g.failed = 'standing'; g.over = true; }
     else if(g.soul <= 0 && !g.failed){ g.failed = 'soul'; g.over = true; }
     return { ds: g.standing - b.s, dso: g.soul - b.so };
@@ -812,6 +917,40 @@ const NineToSurvive = (() => {
       } else {
         a.stage = 5;
         pushFeed(g, min, 'Brad turned his desk eleven degrees away from the aisle. Feng shui, he said.');
+      }
+    }
+    if(id === 'priya_demo'){
+      const priya = g.npcState.priya;
+      priya.counters.demoDay = g.day;
+      if(c.key === 'back'){
+        priya.trust += 3; priya.flags.backed = true;
+        g.npcState.brad.stress = Math.min(3, g.npcState.brad.stress + 1);
+        pushFeed(g, min, 'Someone said “this is Priya’s build” out loud, in the room, on the record.');
+      } else if(c.key === 'dm'){
+        priya.trust += 1; priya.flags.dmed = true;
+      } else if(c.key === 'collect'){
+        addReceipt(g, 'priya_commit_log');
+        priya.flags.collected = true;
+        pushFeed(g, min, 'A commit log was screenshotted. Git remembers everything. So, now, do you.');
+      } else if(c.key === 'slide'){
+        priya.flags.slid = true;
+        pushFeed(g, min, 'The demo was flawless. The credits were fiction. Productivity held.');
+      } else if(c.key === 'bait'){
+        priya.flags.baited = true;
+        if(arcRand(g, 'priya', 'bait')() < 0.5){
+          priya.flags.baitWon = true;
+          priya.trust += 2; g.npcState.brad.stress = 3;
+          const d2 = applyStoryDelta(g, +8, 0);
+          g.lastChoice = { choiceIndex, ds: d.ds + d2.ds, dso: d.dso + d2.dso,
+            outcome: 'Slide four divides by zero, live, on the projector. The presenter, who “built this,” cannot say why. Priya, asked to help, fixes it in forty seconds with HER NAME in the file path on screen. You are a terrible person. The day is perfect.' };
+          return g.lastChoice;
+        }
+        priya.flags.baitLost = true;
+        const d3 = applyStoryDelta(g, -7, 0);
+        pushFeed(g, min, 'IT traced a file swap “in about ten minutes, honestly.” HR was less impressed than IT.');
+        g.lastChoice = { choiceIndex, ds: d.ds + d3.ds, dso: d.dso + d3.dso,
+          outcome: 'The swap traces to your login by end of day. IT is impressed. HR is not. The presenter delivers an apology deck — about you. It has your headshot in it.' };
+        return g.lastChoice;
       }
     }
     if(id === 'hr_survey'){
@@ -885,6 +1024,7 @@ const NineToSurvive = (() => {
     const m = g.npcState && g.npcState.marcus;
     if(!m || !m.flags.shield) return 0;
     delete m.flags.shield;
+    m.counters.saves = (m.counters.saves || 0) + 1;   // his tip just paid out
     return +2;
   }
 
@@ -914,6 +1054,23 @@ const NineToSurvive = (() => {
     pushFeed(g, (min || 0) + 4, 'The presentation was moved, not cancelled. The problem was moved, not solved.');
     return { ds: d.ds, text: 'You mention it to Meredith, gently, meaning well. HR solves the person instead of the workload. Kayla is sent home. A calendar invite is already forming somewhere, like weather.' };
   }
+  // The cost of a story: on days an arc event runs hot (the Boss spiraling, the
+  // survey live or hunting, Kayla's panic day), the day itself bills Soul at
+  // close. Costly, not brutal — good runs should end worn, not gutted.
+  const ARC_HEAT_SOUL = 4;
+  function arcHeatToday(g){
+    const A = g.arcs || {};
+    const bo = A.boss_spiral || { stage: 0 };
+    const hs = A.hr_survey || { stage: 0 };
+    const ka = A.kayla_presentation || { stage: 0 };
+    const br = A.brad_second_job || { stage: 0 };
+    const pr = A.priya_credit || { stage: 0 };
+    return bo.stage === 1 || hs.stage === 1 || hs.stage === 2 || ka.stage === 1
+      || (br.stage >= 3 && br.stage <= 6)    // carrying his secret is also work
+      || pr.stage === 1 || pr.stage === 2    // so is watching the credit line
+      || !!g.dennisBlockerToday;             // and so is a day of numbered questions
+  }
+
   // The dead-eyed play: you watched and kept shipping. Priced at day end.
   const WATCHED_SOUL = 3;
   function kaylaWatchedPrice(g, report){
@@ -922,6 +1079,7 @@ const NineToSurvive = (() => {
     if(!a || a.stage !== 1 || !k) return;
     if(k.flags.satWith || k.flags.tookTask || k.flags.toldHR) return;
     soulHit(g, WATCHED_SOUL);
+    k.flags.ignored = true;   // the story remembers the dead-eyed play
     report.watchedKayla = true;
     pushFeed(g, 1018, 'Productivity held steady today. The dashboard is very proud of everyone.');
   }
@@ -932,6 +1090,46 @@ const NineToSurvive = (() => {
       return d.dso;
     }
     return 0;
+  }
+
+  // ---- Dennis's approvals: the brain's side of the blocker ------------------------
+  const DENNIS_BURN_ORDER = ['hr_survey_metadata', 'priya_commit_log', 'screenshot_brad_deck'];
+  function dennisApprovalCleared(g, min, how, n){
+    const dn = g.npcState.dennis;
+    dn.counters.approvalsCleared = (dn.counters.approvalsCleared || 0) + (n || 1);
+    dn.counters.clearDay = g.day;
+    if(how === 'waited') pushFeed(g, min, 'Dennis had questions. You stood in The Pipe and answered all of them. A filename was defended like family land.');
+    else if(how === 'flattered') pushFeed(g, min, '“Nineteen years — the institutional knowledge!” Dennis approved the file while agreeing.');
+    else if(how === 'receipt') pushFeed(g, min, 'Dennis received a receipt. Approvals followed at unprecedented speed.');
+    else if(how === 'tip') pushFeed(g, min, 'You used Marcus’s phrase. Dennis paused, said “load-bearing, huh,” and approved everything.');
+  }
+  // burn ANY held receipt to clear today's approvals (fixed order, least precious first)
+  function burnReceiptForDennis(g){
+    for(const name of DENNIS_BURN_ORDER)
+      if(burnReceipt(g, name)) return name;
+    return null;
+  }
+  // Marcus's one-shot phrase also unsticks Dennis
+  function useShieldForDennis(g){
+    const m = g.npcState.marcus;
+    if(!m || !m.flags.shield) return false;
+    delete m.flags.shield;
+    m.counters.saves = (m.counters.saves || 0) + 1;
+    return true;
+  }
+
+  // Adam stopped you in the aisle. Again. (Rarely, usefully.)
+  function adamIntercepted(g, min, useful){
+    const ad = g.npcState.adam;
+    if(!ad) return;
+    ad.counters.intercepts = (ad.counters.intercepts || 0) + 1;
+    ad.counters.interceptDay = g.day;
+    if(useful){
+      ad.counters.usefulDay = g.day;
+      pushFeed(g, min, 'Adam “made a call” to Dennis. An approval cleared. Nobody understands the mechanism.');
+    } else {
+      pushFeed(g, min, 'Adam offered unsolicited context on your way past. The context was from 2009.');
+    }
   }
 
   // Never found time for the quick call: the office reads that as an answer.
@@ -957,14 +1155,31 @@ const NineToSurvive = (() => {
   // a fourth choice that burns it to reverse the theft, with interest.
   const CREDIT_ENC = 2;
   function extraChoicesFor(g, encIdx){
+    const extras = [];
     if(encIdx === CREDIT_ENC && hasReceipt(g, 'screenshot_brad_deck') && !bradOutOfPlay(g)){
-      return [{ key: 'burn_screenshot',
-        t: '“Quick question before we move on — Brad, how’s Q3 tracking at the other place?” Screen-share the screenshot.' }];
+      extras.push({ key: 'burn_screenshot',
+        t: '“Quick question before we move on — Brad, how’s Q3 tracking at the other place?” Screen-share the screenshot.' });
     }
-    return [];
+    if(encIdx === CREDIT_ENC && hasReceipt(g, 'priya_commit_log') && !bradOutOfPlay(g)){
+      extras.push({ key: 'burn_commit_log',
+        t: '“Hold on — pull up the commit log. Every line of the last one had a name on it too.”' });
+    }
+    return extras;
   }
   function applyExtraChoice(g, encIdx, key, min){
-    if(key !== 'burn_screenshot' || encIdx !== CREDIT_ENC) return null;
+    if(encIdx !== CREDIT_ENC) return null;
+    if(key === 'burn_commit_log'){
+      if(!burnReceipt(g, 'priya_commit_log')) return null;
+      const d = applyStoryDelta(g, +8, +6);
+      const brad = g.npcState.brad;
+      brad.trust -= 2; brad.stress = Math.min(3, brad.stress + 1);
+      g.npcState.priya.trust += 2;
+      pushFeed(g, min, 'A commit log appeared on the big screen. Authorship stopped being a vibe.');
+      g.lastChoice = { choiceIndex: 'burn_commit_log', ds: d.ds, dso: d.dso,
+        outcome: 'You put Priya’s commit log on the screen next to Brad’s “initiative.” Same move, same guy, receipts this time. The boss looks at Brad the way auditors look at expense reports. Your analysis is yours again — and so, retroactively, is hers.' };
+      return g.lastChoice;
+    }
+    if(key !== 'burn_screenshot') return null;
     if(!burnReceipt(g, 'screenshot_brad_deck')) return null;
     const d = applyStoryDelta(g, +10, +8);   // the theft, reversed, with interest
     const brad = g.npcState.brad;
@@ -1008,9 +1223,12 @@ const NineToSurvive = (() => {
     const ka = A.kayla_presentation || { stage: 0 };
     const brad = (g.npcState && g.npcState.brad) || { flags: {} };
     const kayla = (g.npcState && g.npcState.kayla) || { flags: {} };
+    const pr = A.priya_credit || { stage: 0 };
     return {
       kaylaPanic:     ka.stage === 1 && !kayla.flags.toldHR,
       webinarUntil:   (ka.stage === 2 && ka.webinarDay === g.day) ? 630 : null,
+      priyaGrind:     pr.stage === 1 || pr.stage === 2,   // heads-down until the demo lands
+      dennisBlocker:  !!g.dennisBlockerToday,
       bradLaptop:     b.stage >= 1 && b.stage <= 6,   // the second laptop, drawn
       bradCalls:      b.stage >= 2 && b.stage <= 6,   // status shifts + stairwell trips
       bradDeckAt:     b.stage === 3 ? b.deckAt : null,
@@ -1046,7 +1264,11 @@ const NineToSurvive = (() => {
     const drain = soulDrainFor(g.week);
     let missed = Math.max(0, stats.tasksTotal - stats.tasksDone);
     let forgiven = false;
-    if(g.taskForgivenessToday && missed > 0){ missed--; forgiven = true; }   // Marcus was right
+    if(g.taskForgivenessToday && missed > 0){
+      missed--; forgiven = true;                                             // Marcus was right
+      if(g.npcState && g.npcState.marcus)
+        g.npcState.marcus.counters.saves = (g.npcState.marcus.counters.saves || 0) + 1;
+    }
     const report = { day: g.day, week: g.week, title: jobTitle(g), pay, burn, drain,
                      tasksDone: stats.tasksDone, tasksTotal: stats.tasksTotal,
                      missed, forgiven, decay: DECAY_S,
@@ -1058,6 +1280,7 @@ const NineToSurvive = (() => {
     g.money += pay - burn;
     if(g.money < 0){ g.money = 0; report.broke = true; if(!g.failed) soulHit(g, BROKE_SOUL); }
     if(!g.failed) soulHit(g, drain);
+    if(!g.failed && arcHeatToday(g)){ soulHit(g, ARC_HEAT_SOUL); report.arcHeat = true; }
     if(!g.failed) kaylaWatchedPrice(g, report);
     if(!g.failed && g.day % 5 === 0){ // Friday review
       // the "anonymous" survey attends your review without you — once
@@ -1079,6 +1302,7 @@ const NineToSurvive = (() => {
           // the receipt defuses exactly one warning, then it's spent
           burnReceipt(g, 'hr_survey_metadata');
           report.warningDefused = true;
+          if(mer) mer.counters.defused = (mer.counters.defused || 0) + 1;
           pushFeed(g, 1020, 'The warning was withdrawn after you asked, politely, about survey response IDs.');
         } else {
           soulHit(g, WARN_SOUL); report.warned = true;
@@ -1107,8 +1331,20 @@ const NineToSurvive = (() => {
       return d + 'you became the corner office’s emotional support animal.';
     if(boss.counters.callDay === rep.day)
       return d + 'a quick call was survived at async speed.';
+    const priyaC = g.npcState.priya;
+    if(priyaC.counters.demoDay === rep.day){
+      if(priyaC.flags.backed) return d + 'you said her name in a room where it counted.';
+      if(priyaC.flags.baitWon) return d + 'Brad demoed the wrong file, beautifully.';
+      if(priyaC.flags.baitLost) return d + 'a file swap traced back to your login in one afternoon.';
+      if(priyaC.flags.slid) return d + 'the team was thanked. The team was one person.';
+      return d + 'a demo happened. The commit log knows more than the room does.';
+    }
     if(g.npcState.meredith.counters.surveyDay === rep.day)
       return d + 'HR discovered anonymity has a font.';
+    if(g.npcState.dennis.counters.clearDay === rep.day)
+      return d + 'Dennis defended a filename like it was family land.';
+    if(g.npcState.adam && g.npcState.adam.counters.usefulDay === rep.day)
+      return d + 'Adam knew a guy. The guy was Dennis. It went through.';
     if(g.npcState.kayla.counters.panicDay === rep.day && g.npcState.kayla.flags.toldHR)
       return d + 'HR solved a person instead of a workload.';
     if(g.npcState.kayla.counters.panicDay === rep.day && g.npcState.kayla.flags.satWith)
@@ -1145,6 +1381,10 @@ const NineToSurvive = (() => {
     g.taskStreak = 0; g.deadEyedToday = 0;
     g.taskForgivenessToday = false;
     g.feed = []; g.todayIncidents = [];
+    // Dennis's blocker behavior: roughly one day in four, approvals required
+    g.dennisBlockerToday = arcRand(g, 'dennis', 'blocker')() < 0.25;
+    if(g.dennisBlockerToday)
+      pushFeed(g, 549, 'Dennis changed the approval workflow. The change requires approval. His.');
     advanceArcs(g);
     g.plan = planDay(g);
   }
@@ -1170,7 +1410,7 @@ const NineToSurvive = (() => {
     g.coffeeDay = g.day;
     g.taskStreak = 0;   // a mercy counts as looking up
     const before = g.soul;
-    g.soul = clamp(g.soul + COFFEE_SOUL);
+    g.soul = clamp(g.soul + temperSoulGain(g, COFFEE_SOUL));
     return { dso: g.soul - before };
   }
 
@@ -1206,38 +1446,147 @@ const NineToSurvive = (() => {
     };
   }
 
+  // ═══ THE COMPETENT POLICY (dev/bot section — pure functions, no DOM) ═══════════
+  // One deterministic policy consumed by BOTH ?movie=1 and the headless soak bot,
+  // so what the autopilot demonstrates is exactly what the test suite proves.
+  // It reads g plus a plain world snapshot (w) and returns the next action:
+  // {type:'idle'|'walkout'|'coffee'|'couch'|'chat'(id)|'bosscall'|'home'}.
+
+  // Cards are scored, not memorized: standing + 1.3×soul, with a penalty for
+  // choices that would drop Standing under 35 and a heavy one for Soul under 35.
+  function policyCardChoice(g, encIdx){
+    const enc = ENCOUNTERS[encIdx];
+    if(!enc) return 0;
+    let best = 0, bestScore = -Infinity;
+    enc.choices.forEach((c, i) => {
+      let score = c.s + 1.3 * c.so;
+      if(g.standing + c.s < 35) score -= 8;
+      if(g.soul + c.so < 35) score -= 20;
+      if(score > bestScore){ bestScore = score; best = i; }
+    });
+    return best;
+  }
+
+  // Incidents get named deterministic cases, not scores.
+  function policyIncidentChoice(g, id){
+    if(id === 'brad_discovery') return g.soul < 25 ? 2 : 0;   // screenshot, unless drowning
+    if(id === 'hr_survey') return hasReceipt(g, 'hr_survey_metadata') ? 2 : 3;  // metadata, else help
+    if(id === 'boss_quick_call') return g.soul >= 65 ? 0 : 1; // sympathy only from comfort
+    if(id === 'priya_demo') return g.standing >= 55 ? 0 : 1;  // back her publicly from comfort, else DM
+    return 0;
+  }
+
+  function policyAction(g, w){
+    if(g.over || !w || !w.running) return { type: 'idle' };
+    // the number is the point: leave the moment you can
+    if(canWalkOut(g)){
+      if(w.playerErrand && w.playerErrand.type === 'exit') return { type: 'idle' };
+      return { type: 'walkout' };
+    }
+    if(w.playerErrand) return { type: 'idle' };              // never interrupt an errand
+    const you = (w.actors || []).find(a => a.id === 'you');
+    if(!you || you.path.length) return { type: 'idle' };     // mid-walk: let it finish
+    // a summons is answered with your feet; the card decides the tone
+    if(w.summons && w.summons.status === 'open') return { type: 'bosscall' };
+    // Kayla's panic day is never ignored by default
+    const kayla = g.npcState && g.npcState.kayla;
+    if(w.flags && w.flags.kaylaPanic && kayla
+       && !kayla.flags.satWith && !kayla.flags.tookTask && !w.chatted.kayla)
+      return { type: 'chat', id: 'kayla' };
+    // recover before the grind bills extra — and always when Soul is collapsing
+    const needRecovery = g.soul < 35 || (g.taskStreak >= GRIND_STREAK && w.tasks.pending > 0);
+    if(needRecovery){
+      if(!w.coffeeUsed) return { type: 'coffee' };
+      if(!w.couchUsed) return { type: 'couch' };
+      let pick = null, bestS = -1;
+      ['kayla', 'marcus', 'priya'].forEach(id => {
+        if(w.chatted[id]) return;
+        const a = (w.actors || []).find(x => x.id === id);
+        if(!a || a.off) return;
+        let s = a.mood === 'good' ? 5 : a.mood === 'meh' ? 3 : 2;
+        if(id === 'kayla' && kayla && kayla.flags.bonded) s += 2;
+        if(s > bestS){ bestS = s; pick = id; }
+      });
+      if(pick) return { type: 'chat', id: pick };
+      // the recovery economy is spent; nothing left but the desk
+    }
+    // approvals, cheapest path first: Marcus's phrase when 2+ are stuck (free
+    // and instant), else batch a Pipe trip into idle time. Receipts are never
+    // burned on Dennis — they're story capital.
+    if(w.tasks && w.tasks.blocked >= 2 && g.npcState.marcus && g.npcState.marcus.flags.shield)
+      return { type: 'dennis_tip' };
+    if(w.tasks && w.tasks.blocked > 0 && w.tasks.pending === 0) return { type: 'approval' };
+    return { type: 'home' };
+  }
+
   // ---- Share copy that carries the story ----------------------------------------
-  // The lead line is the run's best real incident, from counters, receipts, and
-  // arc outcomes — never invented. Returns null when the run produced no story
-  // (the shell then falls back to the plain format).
-  function storyLine(g){
-    const brad = g.npcState.brad, boss = g.npcState.boss;
-    const s = g.stats || {};
-    if(brad.flags.walkedOut)
-      return 'I watched Brad get walked out at lunch for working two jobs. His deliverables are my “growth opportunity” now.';
-    if(brad.flags.burned)
-      return 'I put Brad’s other job on the projector mid-meeting. My analysis is mine again. With interest.';
-    if(g.escaped && hasReceipt(g, 'screenshot_brad_deck'))
-      return 'I escaped on Day ' + g.day + ' with ' + fmt(g.money) + ', ' + g.soul
-        + ' Soul, and one screenshot that could end Brad’s quarter.';
-    if(hasReceipt(g, 'screenshot_brad_deck'))
-      return 'Holding one screenshot that could end Brad’s quarter. Haven’t decided. That’s the fun part.';
-    if(hasReceipt(g, 'hr_survey_metadata'))
-      return 'Survived an anonymous survey that knew my middle name. I kept the metadata.';
-    if(brad.flags.covered)
-      return 'I caught Brad working a second job and covered for him. My inbox is a protected wetland. My soul, less so.';
-    if(boss.flags.sympathetic && (boss.counters.quickCalls || 0) >= 2)
-      return 'I became the corner office’s emotional support animal. Standing: excellent. Soul: on file with HR.';
-    if(g.failed === 'standing')
-      return 'Managed out on Day ' + g.day + '. HR called it a transition, which is how you know it was a firing.';
-    if(g.failed === 'soul')
-      return 'Promoted to management on Day ' + g.day + '. Please do not congratulate me.';
-    const bits = [];
-    if(s.crunchWins + s.crunchFails > 0) bits.push((s.crunchWins + s.crunchFails) + ' fire drill' + (s.crunchWins + s.crunchFails > 1 ? 's' : ''));
-    if(s.bradSteals > 0) bits.push(s.bradSteals + ' Brad theft' + (s.bradSteals > 1 ? 's' : ''));
-    if(s.warnings > 0) bits.push(s.warnings + ' formal warning' + (s.warnings > 1 ? 's' : ''));
-    if(bits.length >= 2) return 'Survived ' + bits.join(', ').replace(/, ([^,]*)$/, ', and $1') + '.';
+  // A deterministic story-priority ladder over the run's REAL events. storyKey
+  // classifies (highest interest first, per the ladder); storyLine speaks it.
+  // Returns null when the run produced no story (shell falls back to plain).
+  function storyKey(g){
+    const brad = g.npcState.brad, boss = g.npcState.boss, kayla = g.npcState.kayla;
+    const marcus = g.npcState.marcus, mer = g.npcState.meredith, priya = g.npcState.priya;
+    const bossArc = (g.arcs || {}).boss_spiral || { stage: 0 };
+    if(brad.flags.walkedOut || brad.flags.fired || brad.flags.burned) return 'brad_exposed';
+    if(kayla.flags.satWith || kayla.flags.tookTask) return 'kayla_helped';
+    if(kayla.flags.ignored) return 'kayla_ignored';
+    if(hasReceipt(g, 'hr_survey_metadata')) return 'hr_metadata';
+    if(bossArc.stage === 2 && (boss.counters.quickCalls || 0) > 0) return 'boss_survived';
+    if((marcus.counters.saves || 0) > 0) return 'marcus_saved';
+    if(priya.flags.backed || priya.flags.baited) return 'priya_backed';
+    if((g.npcState.dennis.counters.approvalsCleared || 0) >= 3) return 'dennis_broken';
+    if((mer.counters.defused || 0) > 0) return 'warning_defused';
+    if(g.escaped && g.soul >= 50) return 'escaped_clean';
+    if(g.escaped) return 'escaped_dead_inside';
+    if(g.failed === 'standing') return 'managed_out';
+    if(g.failed === 'soul') return 'management';
     return null;
+  }
+  function storyLine(g){
+    const key = storyKey(g);
+    const brad = g.npcState.brad;
+    switch(key){
+      case 'brad_exposed':
+        if(brad.flags.walkedOut || brad.flags.fired)
+          return 'I watched Brad get walked out at lunch for working two jobs. His deliverables are my “growth opportunity” now.';
+        return 'I put Brad’s other job on the projector mid-meeting. My analysis is mine again. With interest.';
+      case 'kayla_helped':
+        return g.npcState.kayla.flags.satWith
+          ? 'Two chairs in the kitchen the day the deck hit version 31. It helped more than the deck did.'
+          : 'I quietly took a deliverable off Kayla’s stack the day everything was “fine.” No email announced it.';
+      case 'kayla_ignored':
+        return 'Kayla melted down in the kitchen and I kept shipping. The dashboard called it a strong day.';
+      case 'hr_metadata':
+        return 'Survived an anonymous survey that knew my middle name. I kept the metadata.';
+      case 'warning_defused':
+        return 'HR opened a warning. I asked about survey response IDs. The warning closed itself.';
+      case 'boss_survived':
+        return 'I survived the corner office’s personal weather system. He is more human now. The numbers are not.';
+      case 'marcus_saved':
+        return 'Marcus said one sentence over coffee that saved my quarter. He has seen this exact quarter before.';
+      case 'priya_backed':
+        if(g.npcState.priya.flags.baitWon)
+          return 'Brad demoed Priya’s stolen dashboard, so I fed him a flawed file. Slide four divided by zero, live. She fixed it with her name on screen.';
+        if(g.npcState.priya.flags.baitLost)
+          return 'I sabotaged the demo of Priya’s stolen work. IT traced it to me in an afternoon. Worth it. Mostly.';
+        return 'Brad demoed Priya’s work, so I put her name back on it in front of everyone who mattered.';
+      case 'dennis_broken':
+        return 'I outlasted Dennis. Approval by approval, question by question. The Pipe flows for me now.';
+      case 'escaped_clean':
+      case 'escaped_dead_inside':
+        if(hasReceipt(g, 'screenshot_brad_deck'))
+          return 'I escaped on Day ' + g.day + ' with ' + fmt(g.money) + ', ' + g.soul
+            + ' Soul, and one screenshot that could end Brad’s quarter.';
+        return key === 'escaped_clean'
+          ? 'I hit my number, stood up, and walked out whole. Day ' + g.day + ', ' + fmt(g.money) + ', zero regrets.'
+          : 'I escaped on Day ' + g.day + ' with ' + fmt(g.money) + ' and whatever was left of me. Mostly the money.';
+      case 'managed_out':
+        return 'Managed out on Day ' + g.day + '. HR called it a transition, which is how you know it was a firing.';
+      case 'management':
+        return 'Promoted to management on Day ' + g.day + '. Please do not congratulate me.';
+      default:
+        return null;
+    }
   }
   function shareText(g){
     const headline = g.over ? verdict(g).title : 'Still there. Still counting.';
@@ -1256,6 +1605,7 @@ const NineToSurvive = (() => {
     FU_TARGET, DAY_ENCOUNTERS, BURN_BASE, BURN_STEP,
     PROMOTE_AT, PROMOTE_RESET, PROMOTE_SOUL, WARN_AT, WARN_SOUL, BROKE_SOUL,
     CRUNCH_WIN, CRUNCH_LOSE, CRUNCH_BONUS, COFFEE_SOUL, DECAY_S, TASK_MISS_S, WORLD_EFFECTS,
+    ARC_HEAT_SOUL, arcHeatToday, SOUL_COMFORT,
     GRIND_STREAK, GRIND_SOUL,
     clamp, fmt, burnFor, soulDrainFor,
     newGame, planDay, currentEncounter, isFinalEncounter, jobTitle,
@@ -1266,9 +1616,12 @@ const NineToSurvive = (() => {
     ARC_INCIDENTS, applyIncidentChoice, extraChoicesFor, applyExtraChoice,
     BRAD_ENCS, bradOutOfPlay, bradDeckSeen, bradAllHands, bradFiredReport, bradTasksAbsorbed,
     bossSummonsDodged, bossHumanBeat, bossCatchMod,
+    dennisApprovalCleared, burnReceiptForDennis, useShieldForDennis, DENNIS_BURN_ORDER,
+    adamIntercepted,
     marcusTip, consumeCatchShield, dayHeadline, dayAward,
     kaylaSitWith, kaylaTaskTaken, kaylaSentHome, chatBonus, WATCHED_SOUL,
-    storyLine, shareText
+    storyLine, storyKey, shareText, ARC_POOL, pickArcs,
+    policyAction, policyCardChoice, policyIncidentChoice
   };
 })();
 
@@ -1316,6 +1669,7 @@ const FURNITURE = [
   { id:'desk-kayla',  label:null,        x:8,  y:19, w:2, d:1, h:0.55, color:'#7d858f' },
   { id:'desk-marcus', label:null,        x:13, y:19, w:2, d:1, h:0.55, color:'#7d858f' },
   { id:'desk-priya',  label:null,        x:18, y:19, w:2, d:1, h:0.55, color:'#7d858f' },
+  { id:'desk-adam',   label:null,        x:18, y:15, w:2, d:1, h:0.55, color:'#7d858f' },
   { id:'desk-boss',   label:null,        x:33, y:4,  w:3, d:1, h:0.7,  color:'#4a4238' },
   { id:'desk-hr',     label:null,        x:4,  y:4,  w:2, d:1, h:0.55, color:'#8f7d88' },
   { id:'desk-dennis', label:null,        x:34, y:20, w:2, d:1, h:0.55, color:'#6f7a6f' },
@@ -1336,6 +1690,8 @@ const COUCH_SPOT  = { x:3,  y:21 };
 const EXIT_SPOT   = { x:1,  y:17 };
 const STAIRS_SPOT = { x:37, y:13 };   // where the private calls happen
 const KITCHEN_CORNER = { x:24, y:12 };   // where Kayla "gets water" on the bad day
+const APPROVAL_SPOT = { x:34, y:21 };    // The Pipe: where approvals go to be questioned
+const APPROVAL_WAIT_SECS = 6;            // his questions, answered in real seconds
 
 // ── zones: colored floor rugs with labels ─────────────────────────────────────
 const ZONES = [
@@ -1386,7 +1742,13 @@ const CAST = [
     spot:{x:19, y:20},
     lines:{ good:'Shipped early. Nobody noticed. She noticed.',
             meh:'In four meetings that could be emails.',
-            bad:'Brad presented her numbers this morning.' } }
+            bad:'Brad presented her numbers this morning.' } },
+  // appended LAST so his seeding can ride a side stream (see newDay)
+  { id:'adam',   name:'Adam',   role:'Institutional knowledge, self-appointed', color:'#A88C5F',
+    spot:{x:19, y:16},
+    lines:{ good:'Has concerns about the process. Would love to share them. Will regardless.',
+            meh:'Was not consulted, and it shows, he says.',
+            bad:'Drafting a memo about lanes, and who should stay in whose.' } }
 ];
 
 // Which NPC owns each encounter in the pool (by ENCOUNTERS index, clock order):
@@ -1503,7 +1865,8 @@ function newDay(seed, day, plan, flags){
     activeEvent: null,
     // the actual work: tasks land in your inbox through the day (load seeded below)
     tasks: { pending: 0, done: 0, spawned: 0, total: 0, progress: 0,
-             spawnAt: [] },
+             spawnAt: [], blocked: 0, blockedAt: [] },
+    flatteredDennis: false,
     // threats
     bossWalks: [],           // [{atMin, status:'pending'|'out'|'done'}]
     bradRaids: [],
@@ -1523,15 +1886,39 @@ function newDay(seed, day, plan, flags){
     walkoutArmed: false,     // the shell arms this when the number is banked
     dayOver: false
   };
-  // seed wander timers + daily moods deterministically
+  // seed wander timers + daily moods deterministically — Adam is EXCLUDED here
+  // and seeded from a side stream below, so every pre-Adam seeded expectation
+  // (moods, walks, raids, crunch, task loads) is byte-identical
   w.actors.forEach(a => {
+    if(a.id === 'adam') return;
     a.wanderT = 2 + rand(w) * 6;
     if(a.id !== 'you') a.mood = MOODS[Math.floor(rand(w) * 3)];
   });
+  (() => {
+    let s = ((seed | 0) ^ Math.imul(day, 40503) ^ 0x5EEDADA) | 0;
+    const ar = () => {
+      s = (s + 0x6D2B79F5) | 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const adam = getActor(w, 'adam');
+    if(adam){ adam.wanderT = 2 + ar() * 6; adam.mood = MOODS[Math.floor(ar() * 3)]; }
+    w.adamRolls = Array.from({ length: 12 }, ar);   // interception + usefulness rolls
+    w.adamRollIdx = 0;
+  })();
+  w.adamIntercepts = 0;
+  w.adamNextOk = 0;
+  w.intercept = null;
   // Kayla's panic day: she's in the kitchen, and she's staying there
   if(flags.kaylaPanic){
     const kayla = getActor(w, 'kayla');
     if(kayla){ kayla.x = KITCHEN_CORNER.x; kayla.y = KITCHEN_CORNER.y; kayla.pinned = true; kayla.mood = 'bad'; }
+  }
+  // Priya's build week: heads down at her desk, visibly, until the demo lands
+  if(flags.priyaGrind){
+    const priya = getActor(w, 'priya');
+    if(priya) priya.pinned = true;
   }
   w.kaylaTaskTaken = false;
   w.kaylaReported = false;
@@ -1541,6 +1928,10 @@ function newDay(seed, day, plan, flags){
   w.tasks.spawnAt = [540, 540, 540];
   const drip = Math.floor(390 / Math.max(1, w.tasks.total - 3));
   for(let i = 3; i < w.tasks.total; i++) w.tasks.spawnAt.push(560 + (i - 3) * drip);
+  // Dennis's blocker day: some arrivals are marked needs-approval at staging
+  // (never the 9:00 three — the morning starts workable)
+  w.tasks.blockedAt = w.tasks.spawnAt.map((at, i) =>
+    !!flags.dennisBlocker && i >= 3 && rand(w) < 0.30);
   // boss floor-walks: two, spaced through the day (+1 while his arc runs hot)
   const walks = BOSS_WALKS_PER_DAY + (flags.extraBossWalks || 0);
   for(let i = 0; i < walks; i++)
@@ -1607,8 +1998,15 @@ function step(w, dt){
 
   // ---- task drip + working at your desk ----
   while(w.tasks.spawned < w.tasks.total && w.clockMin >= w.tasks.spawnAt[w.tasks.spawned]){
-    w.tasks.spawned++; w.tasks.pending++;
-    w.sig.push({ type:'task', pending: w.tasks.pending });
+    const needsApproval = !!w.tasks.blockedAt[w.tasks.spawned];
+    w.tasks.spawned++;
+    if(needsApproval){
+      w.tasks.blocked++;
+      w.sig.push({ type:'taskblocked', blocked: w.tasks.blocked });
+    } else {
+      w.tasks.pending++;
+      w.sig.push({ type:'task', pending: w.tasks.pending });
+    }
   }
   if(w.tasks.pending > 0 && playerAtDesk(w) && !you.path.length && !inWebinar){
     w.tasks.progress += dt / TASK_WORK_SECS;
@@ -1618,8 +2016,35 @@ function step(w, dt){
     }
   }
 
+  // ---- the interception: unsolicited advice at walking distance ----
+  if(w.intercept){
+    w.intercept.t += dt;
+    if(w.intercept.t >= 2.5){
+      const usefulRoll = w.adamRollIdx < w.adamRolls.length ? w.adamRolls[w.adamRollIdx++] : 1;
+      const useful = usefulRoll < 0.15 && w.tasks.blocked > 0;
+      if(useful){ w.tasks.blocked--; w.tasks.pending++; }   // he and Dennis go way back
+      w.sig.push({ type:'adamintercept', useful });
+      w.intercept = null;
+      w.adamNextOk = w.clockMin + 60;
+    }
+  } else {
+    const adamI = getActor(w, 'adam');
+    if(adamI && !adamI.off && adamI.state === 'idle' && you.path.length
+       && w.adamIntercepts < 2 && w.clockMin >= w.adamNextOk
+       && Math.hypot(adamI.x - you.x, adamI.y - you.y) < 1.7){
+      const roll = w.adamRollIdx < w.adamRolls.length ? w.adamRolls[w.adamRollIdx++] : 1;
+      if(roll < 0.35){
+        w.adamIntercepts++;
+        w.intercept = { t: 0 };
+      } else {
+        w.adamNextOk = w.clockMin + 45;   // he let you pass. This time.
+      }
+    }
+  }
+
   // ---- movement + wander ----
   w.actors.forEach(a => {
+    if(a.id === 'you' && w.intercept) return;   // held mid-stride by the advice
     if(a.path.length){
       if(moveAlongPath(a, dt)) handleArrival(w, a, you);
       return;
@@ -1700,6 +2125,16 @@ function step(w, dt){
     }
   }
 
+  // ---- the approval wait: standing in The Pipe, answering the questions ----
+  if(w.playerErrand && w.playerErrand.type === 'approvalwait'){
+    w.playerErrand.t += dt;
+    if(w.playerErrand.t >= APPROVAL_WAIT_SECS){
+      w.playerErrand = null;
+      if(w.tasks.blocked > 0){ w.tasks.blocked--; w.tasks.pending++; }
+      w.sig.push({ type:'approved', blocked: w.tasks.blocked, pending: w.tasks.pending });
+    }
+  }
+
   // ---- the quick-call summons: answer with your feet, or let it expire ----
   if(w.summons){
     if(w.summons.status === 'pending' && w.clockMin >= w.summons.atMin){
@@ -1728,7 +2163,14 @@ function step(w, dt){
   if(w.nextEvent < w.events.length){
     const ev = w.events[w.nextEvent];
     if(ev.status === 'pending' && w.clockMin >= ev.atMin){
-      const owner = getActor(w, ev.owner);
+      let owner = getActor(w, ev.owner);
+      // the owner left the floor mid-day (fired, sent home): somebody else
+      // delivers the news — a card may never strand the day
+      if(!owner || owner.off){
+        const sub = ['marcus', 'priya', 'kayla', 'boss', 'hr']
+          .find(id => { const a = getActor(w, id); return a && !a.off; });
+        if(sub){ ev.owner = sub; owner = getActor(w, sub); }
+      }
       if(owner && !owner.off
          && (owner.state === 'idle' || owner.state === 'walking' || owner.state === 'returning')){
         owner.path = [];
@@ -1844,6 +2286,22 @@ function arriveErrand(w, you){
     } else if(e.repaths < 3){
       e.repaths++;
       sendTo(w, you, adjacentTo(w, kayla), 'errand');
+    } else {
+      w.playerErrand = null;
+    }
+  } else if(e.type === 'approval'){
+    // you made it to The Pipe: now you wait out the questions, visibly
+    w.playerErrand = { type: 'approvalwait', t: 0 };
+  } else if(e.type === 'flatter'){
+    const dennis = getActor(w, 'dennis');
+    if(!dennis || dennis.off || !w.tasks.blocked){ w.playerErrand = null; }
+    else if(Math.hypot(dennis.x - you.x, dennis.y - you.y) <= 2.2){
+      w.playerErrand = null;
+      w.tasks.blocked--; w.tasks.pending++;
+      w.sig.push({ type:'flattered', blocked: w.tasks.blocked, pending: w.tasks.pending });
+    } else if(e.repaths < 3){
+      e.repaths++;
+      sendTo(w, you, adjacentTo(w, dennis), 'errand');
     } else {
       w.playerErrand = null;
     }
@@ -1966,6 +2424,30 @@ function reportKayla(w){
   w.kaylaReported = true;
   return true;
 }
+function goForApproval(w){
+  if(!w.tasks.blocked || w.playerErrand) return false;
+  const you = getActor(w, 'you');
+  if(!sendTo(w, you, APPROVAL_SPOT, 'errand')) return false;
+  w.playerErrand = { type: 'approval', repaths: 0 };
+  w.moveMarker = APPROVAL_SPOT;
+  return true;
+}
+function flatterDennis(w){
+  if(!w.tasks.blocked || w.flatteredDennis || w.playerErrand) return false;
+  const dennis = getActor(w, 'dennis');
+  const you = getActor(w, 'you');
+  if(!dennis || dennis.off || !sendTo(w, you, adjacentTo(w, dennis), 'errand')) return false;
+  w.flatteredDennis = true;
+  w.playerErrand = { type: 'flatter', repaths: 0 };
+  w.moveMarker = null;
+  return true;
+}
+function clearAllBlocked(w){
+  const n = w.tasks.blocked;
+  w.tasks.pending += n;
+  w.tasks.blocked = 0;
+  return n;
+}
 function goForBossCall(w){
   if(!w.summons || w.summons.status !== 'open') return false;
   const boss = getActor(w, 'boss');
@@ -2037,6 +2519,24 @@ function statusOf(w, actor){
       chat: !w.chatted[actor.id],           // "chat" = walk over and sit with her
       sitWith: !w.chatted[actor.id],
       kaylatask: !w.kaylaTaskTaken };
+  }
+  // Dennis on a blocker day: the popup explains the stack and offers the paths
+  if(actor.id === 'dennis' && w.flags && w.flags.dennisBlocker){
+    return { name: actor.name, role: actor.role, mood: actor.mood,
+      face: MOOD_FACE[actor.mood],
+      line: w.tasks.blocked > 0
+        ? 'He “has questions” about ' + w.tasks.blocked + ' of your files. He has numbered the questions.'
+        : 'Approvals required today. Nothing of yours is stuck. Yet.',
+      chat: false,
+      approval: w.tasks.blocked > 0,
+      flatter: w.tasks.blocked > 0 && !w.flatteredDennis,
+      dennisBlocked: w.tasks.blocked };
+  }
+  // Priya's build week: the grind is visible from her status line
+  if(actor.id === 'priya' && w.flags && w.flags.priyaGrind && !actor.off){
+    return { name: actor.name, role: actor.role, mood: actor.mood, face: '🎧',
+      line: 'Do not ask if it’s done. It’s almost done. It has been almost done at 2 AM three nights running.',
+      chat: !!actor.chat && !w.chatted[actor.id] };
   }
   if(actor.id === 'hr' && w.flags && w.flags.kaylaPanic && !w.kaylaReported){
     return { name: actor.name, role: actor.role, mood: actor.mood,
@@ -2501,6 +3001,23 @@ function drawBox(ctx, cam, f, w){
     ctx.textAlign = 'center';
     ctx.fillText('×' + w.tasks.pending, ix, iy - hpx - Math.min(8, w.tasks.pending) * 3.2 * z - 6 * z);
   }
+  // needs-approval stack: red-edged papers, stuck until Dennis is dealt with
+  if(f.id === 'desk-you' && w && w.tasks.blocked > 0){
+    const [bx2, by2] = proj(cam, f.x - 0.15, f.y - 0.15);
+    for(let i = 0; i < Math.min(6, w.tasks.blocked); i++){
+      ctx.fillStyle = '#f5e3df';
+      ctx.strokeStyle = '#D8443F'; ctx.lineWidth = 1.4;
+      const py2 = by2 - hpx - i * 3.2 * z;
+      ctx.beginPath();
+      ctx.moveTo(bx2, py2 - 4 * z); ctx.lineTo(bx2 + 9 * z, py2);
+      ctx.lineTo(bx2, py2 + 4 * z); ctx.lineTo(bx2 - 9 * z, py2);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    ctx.fillStyle = '#b3322e';
+    ctx.font = '800 ' + Math.max(9, 11 * z) + 'px Poppins, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('!' + w.tasks.blocked, bx2, by2 - hpx - Math.min(6, w.tasks.blocked) * 3.2 * z - 6 * z);
+  }
 }
 
 function drawActor(ctx, cam, a, w){
@@ -2515,9 +3032,24 @@ function drawActor(ctx, cam, a, w){
   ctx.beginPath(); ctx.ellipse(px, py - 11 * z, 8 * z, 11 * z, 0, 0, Math.PI * 2);
   ctx.fillStyle = a.color; ctx.fill();
   ctx.strokeStyle = 'rgba(21,18,13,0.35)'; ctx.lineWidth = 1.3 * z; ctx.stroke();
-  ctx.beginPath(); ctx.arc(px, py - 26 * z, 6.5 * z, 0, Math.PI * 2);
-  ctx.fillStyle = a.bear ? '#7d7871' : '#E8C39E'; ctx.fill();   // badger gray
+  const dome = a.id === 'adam' ? 7.2 * z : 6.5 * z;   // Adam's is... more
+  ctx.beginPath(); ctx.arc(px, py - 26 * z, dome, 0, Math.PI * 2);
+  ctx.fillStyle = a.bear ? '#7d7871' : a.id === 'adam' ? '#EFD3AE' : '#E8C39E'; ctx.fill();
   ctx.strokeStyle = 'rgba(21,18,13,0.3)'; ctx.lineWidth = 1.1 * z; ctx.stroke();
+  if(a.id === 'adam'){
+    // the shine: readable from across the floor
+    ctx.beginPath(); ctx.ellipse(px - 2.2 * z, py - 29.5 * z, 2.6 * z, 1.5 * z, -0.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.fill();
+  }
+  // the interception, visible: he is talking AT you
+  if(a.id === 'adam' && w && w.intercept){
+    ctx.font = (13 * z) + 'px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('💬', px + 12 * z, py - 34 * z);
+    ctx.fillStyle = 'rgba(21,18,13,0.55)';
+    ctx.font = '700 ' + Math.max(8, 9 * z) + 'px Poppins, sans-serif';
+    ctx.fillText('“quick thought—”', px, py - 44 * z);
+  }
   if(a.bear){
     ctx.beginPath(); ctx.arc(px - 5 * z, py - 31 * z, 2.6 * z, 0, Math.PI * 2);
     ctx.arc(px + 5 * z, py - 31 * z, 2.6 * z, 0, Math.PI * 2);
@@ -2535,6 +3067,14 @@ function drawActor(ctx, cam, a, w){
     ctx.fillStyle = '#D8443F';
     ctx.font = '800 ' + (14 * z) + 'px system-ui';
     ctx.fillText('❗', px - 12 * z, py - 34 * z);
+  }
+  // the approval wait: an amber bar while the questions are answered
+  if(a.id === 'you' && w && w.playerErrand && w.playerErrand.type === 'approvalwait'){
+    const bw2 = 30 * z;
+    ctx.fillStyle = 'rgba(21,18,13,0.25)';
+    ctx.fillRect(px - bw2 / 2, py - 40 * z, bw2, 5 * z);
+    ctx.fillStyle = '#E8814C';
+    ctx.fillRect(px - bw2 / 2, py - 40 * z, bw2 * Math.min(1, w.playerErrand.t / APPROVAL_WAIT_SECS), 5 * z);
   }
   // your work-in-progress bar
   if(a.id === 'you' && w && w.tasks.progress > 0 && playerAtDesk(w)){
@@ -2581,6 +3121,7 @@ return {
   setEncounters, newDay, step, resolveEncounter, resolveCrunch, eventsRemaining,
   movePlayer, goForCoffee, goForCouch, requestChat, playerGoHome, playerAtDesk,
   armWalkout, goForExit, goForBossCall, resolveQuickCall, takeKaylaTask, reportKayla,
+  goForApproval, flatterDennis, clearAllBlocked, APPROVAL_WAIT_SECS,
   sendTo, bfsPath, isWalkable, adjacentTo, getActor,
   pickActorAt, furnitureAt, isCoffeeAt, isCouchAt, isExitAt, statusOf, clockToMin, minToClock,
   render, proj, screenToTile
@@ -3021,7 +3562,13 @@ function showStatus(actor, sx, sy){
     + (s.chat ? '<span class="schat" onclick="startChat(\'' + actor.id + '\')">' + (s.sitWith ? 'Walk over & sit with her' : 'Walk over & chat') + '</span>' : '')
     + (s.quickcall ? '<span class="schat" onclick="startQuickCall()">Take the quick call</span>' : '')
     + (s.kaylatask ? '<span class="schat" onclick="takeKaylaTask()">Take one of her tasks</span>' : '')
-    + (s.reportkayla ? '<span class="schat" onclick="reportKaylaToHR()">Mention Kayla to HR</span>' : '');
+    + (s.reportkayla ? '<span class="schat" onclick="reportKaylaToHR()">Mention Kayla to HR</span>' : '')
+    + (s.approval ? '<span class="schat" onclick="carryToPipe()">Carry a file to The Pipe</span>' : '')
+    + (s.flatter ? '<span class="schat" onclick="flatterDennis()">“Nineteen years — wow.”</span>' : '')
+    + (s.approval && G.DENNIS_BURN_ORDER.some(r => G.hasReceipt(g, r))
+        ? '<span class="schat" onclick="burnForDennis()">🧾 Burn a receipt (clears all)</span>' : '')
+    + (s.approval && g.npcState.marcus.flags.shield
+        ? '<span class="schat" onclick="tipForDennis()">Use Marcus’s phrase (clears all)</span>' : '');
   pop.classList.remove('hidden');
   pop.style.left = Math.min(window.innerWidth - 260, sx + 14) + 'px';
   pop.style.top = Math.min(window.innerHeight - 150, Math.max(10, sy - 40)) + 'px';
@@ -3042,6 +3589,31 @@ function takeKaylaTask(){
 function reportKaylaToHR(){
   hideStatus();
   if(W.reportKayla(world)) toast('You mention it to Meredith. Gently. Meaning well. Watch.');
+}
+function carryToPipe(){
+  hideStatus();
+  if(W.goForApproval(world)) toast('Carrying the file to The Pipe. Bring answers. He has questions.');
+}
+function flatterDennis(){
+  hideStatus();
+  if(W.flatterDennis(world)) toast('Walking over to admire nineteen years of institutional knowledge…');
+}
+function burnForDennis(){
+  hideStatus();
+  const name = G.burnReceiptForDennis(g);
+  if(!name) return;
+  const n = W.clearAllBlocked(world);
+  G.dennisApprovalCleared(g, Math.floor(world.clockMin), 'receipt', n);
+  toast('Receipt burned (' + name.replace(/_/g, ' ') + '). ' + n + ' approval' + (n > 1 ? 's' : '') + ' cleared, instantly.');
+  saveRun('day');
+}
+function tipForDennis(){
+  hideStatus();
+  if(!G.useShieldForDennis(g)) return;
+  const n = W.clearAllBlocked(world);
+  G.dennisApprovalCleared(g, Math.floor(world.clockMin), 'tip', n);
+  toast('“Load-bearing deliverable.” Dennis blinks. ' + n + ' approval' + (n > 1 ? 's' : '') + ' cleared.');
+  saveRun('day');
 }
 
 /* ---- the office feed (render only — the brain writes g.feed) ---- */
@@ -3183,9 +3755,15 @@ function loop(t){
     const parts = c.split(' ');
     return '<b>' + parts[0] + '</b> ' + parts[1];
   })();
-  $id('tasks-l').textContent = 'INBOX · ' + world.tasks.pending + ' waiting';
+  $id('tasks-l').textContent = 'INBOX · ' + world.tasks.pending + ' waiting'
+    + (world.tasks.blocked ? ' · ' + world.tasks.blocked + ' NEED APPROVAL' : '');
   $id('tasks-r').textContent = world.tasks.done + '/' + world.tasks.total + ' shipped';
   if(g.feed.length !== feedShown) renderFeed();
+  // a crunch bonus can bank the number mid-day: the door goes live immediately
+  if(!world.walkoutArmed && G.canWalkOut(g)){
+    W.armWalkout(world);
+    toast('Your number is banked. The EXIT is live. Any time.');
+  }
   const rc = g.receipts ? g.receipts.count : 0;
   $id('receiptline').classList.toggle('hidden', rc === 0);
   if(rc > 0) $id('receipts-r').textContent = rc + ' held · leverage, technically';
@@ -3253,6 +3831,12 @@ function handleSignal(s){
       SFX.drill();
       toast('MANDATORY: “Resilience & You,” 90 min, cameras expected. Your inbox will wait. It will not shrink.');
       break;
+    case 'adamintercept':
+      G.adamIntercepted(g, Math.floor(world.clockMin), s.useful);
+      toast(s.useful
+        ? 'Adam stopped you mid-aisle — then called Dennis. An approval just… cleared. Don’t ask.'
+        : 'Adam stopped you for a quick thought. It had three parts. You are eight minutes older.');
+      break;
     case 'bosshuman': {
       const line = G.bossHumanBeat(g, Math.floor(world.clockMin));
       if(line){
@@ -3263,6 +3847,21 @@ function handleSignal(s){
     }
     case 'task':
       toast('New task in your inbox. (' + s.pending + ' waiting)'); break;
+    case 'taskblocked':
+      toast('A task arrived marked NEEDS APPROVAL. Dennis has questions. (' + s.blocked + ' stuck)');
+      break;
+    case 'approved':
+      G.dennisApprovalCleared(g, Math.floor(world.clockMin), 'waited');
+      toast('Questions answered. One file unstuck. ' + (s.blocked ? s.blocked + ' still held.' : 'The Pipe is clear.'));
+      W.playerGoHome(world);
+      break;
+    case 'flattered': {
+      worldEffect('dennisFlatter');
+      G.dennisApprovalCleared(g, Math.floor(world.clockMin), 'flattered');
+      toast('He approved one mid-anecdote. Soul −2. ' + (s.blocked ? s.blocked + ' still held.' : 'All clear.'));
+      W.playerGoHome(world);
+      break;
+    }
     case 'taskdone': {
       const res = worldEffect('taskDone');
       SFX.task();
@@ -3408,8 +4007,12 @@ if(MOVIE){
     }
     if(!$id('cardoverlay').classList.contains('hidden')){
       if(!$id('enc').classList.contains('hidden')){
-        const c = document.querySelector('#choices .choice[data-idx="2"]')
-               || document.querySelector('#choices .choice');   // 2-choice incidents
+        // the ONE policy picks — same function the headless soak proves
+        const incId = $id('cardoverlay').dataset.incident;
+        const idx = incId ? G.policyIncidentChoice(g, incId)
+                          : G.policyCardChoice(g, g.plan[g.idxInDay]);
+        const c = document.querySelector('#choices .choice[data-idx="' + idx + '"]')
+               || document.querySelector('#choices .choice');
         if(c) c.click();
       } else {
         $id('nextbtn').click();
@@ -3420,13 +4023,25 @@ if(MOVIE){
       $id('workbtn').click();   // mashes to a win, then the same button closes it
       return;
     }
-    if(!MOVIE_GREED && world && world.running && world.walkoutArmed && !world.playerErrand){
-      if(W.goForExit(world)) console.log('[MOVIE] number banked mid-day — heading for the EXIT door');
-      return;
-    }
-    if(world && world.running && !world.playerErrand && !W.playerAtDesk(world)){
-      const you = W.getActor(world, 'you');
-      if(!you.path.length) W.playerGoHome(world);
+    if(world && world.running){
+      let act = G.policyAction(g, world);
+      if(act.type === 'walkout' && MOVIE_GREED) act = { type: 'home' };  // greed never leaves
+      if(act.type === 'walkout'){
+        if(W.goForExit(world)) console.log('[MOVIE] number banked — heading for the EXIT door');
+      }
+      else if(act.type === 'coffee') W.goForCoffee(world);
+      else if(act.type === 'couch') W.goForCouch(world);
+      else if(act.type === 'chat') W.requestChat(world, act.id);
+      else if(act.type === 'bosscall') W.goForBossCall(world);
+      else if(act.type === 'approval') W.goForApproval(world);
+      else if(act.type === 'dennis_tip' && G.useShieldForDennis(g)){
+        const clearedN = W.clearAllBlocked(world);
+        G.dennisApprovalCleared(g, Math.floor(world.clockMin), 'tip', clearedN);
+      }
+      else if(act.type === 'home' && !W.playerAtDesk(world)){
+        const you = W.getActor(world, 'you');
+        if(!you.path.length) W.playerGoHome(world);
+      }
     }
   }, 120);
 }
@@ -3458,6 +4073,7 @@ setInterval(() => {
 function openCard(){
   hideStatus();
   const e = G.currentEncounter(g);
+  delete $id('cardoverlay').dataset.incident;
   $id('cardoverlay').classList.remove('hidden');
   $id('enc').classList.remove('hidden');
   $id('out').classList.add('hidden');
@@ -3518,6 +4134,7 @@ function openIncident(id){
   const def = G.ARC_INCIDENTS[id];
   if(!def){ W.resolveEncounter(world); return; }   // unknown id: never strand the day
   activeIncident = id;
+  $id('cardoverlay').dataset.incident = id;        // the autopilot policy reads this
   $id('cardoverlay').classList.remove('hidden');
   $id('enc').classList.remove('hidden');
   $id('out').classList.add('hidden');
@@ -3641,6 +4258,7 @@ function showDayEnd(){
   if(rep.missed) rows.splice(2, 0, ['Died in the inbox (' + rep.missed + ')', 'Standing −' + rep.missed * G.TASK_MISS_S, 'minus']);
   if(rep.forgiven) rows.push(['Marcus was right — nobody read it before Thursday', 'one missed task forgiven', 'plus']);
   if(rep.watchedKayla) rows.push(['You kept your head down. It stayed down.', 'Soul −' + G.WATCHED_SOUL, 'soulhit']);
+  if(rep.arcHeat) rows.push(['The day had subplots. You were in them.', 'Soul −' + G.ARC_HEAT_SOUL, 'soulhit']);
   if(rep.deadEyed) rows.push(['Dead-eyed productivity — ' + rep.deadEyed + ' task' + (rep.deadEyed > 1 ? 's' : '') + ' shipped without looking up', 'Soul −' + rep.deadEyed * G.GRIND_SOUL + ' (already billed)', 'soulhit']);
   if(rep.broke) rows.push(['Overdraft. The fear at the ATM.', 'Soul −' + G.BROKE_SOUL, 'soulhit']);
   if(rep.promoted) rows.push(['PROMOTED → ' + rep.newTitle, 'Standing → ' + G.PROMOTE_RESET + ' · Soul −' + G.PROMOTE_SOUL, 'big']);
