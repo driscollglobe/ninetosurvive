@@ -14,7 +14,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2341E3D6'/%3E%3Ccircle cx='22' cy='20' r='7' fill='%236e4620'/%3E%3Ccircle cx='42' cy='20' r='7' fill='%236e4620'/%3E%3Ccircle cx='32' cy='36' r='18' fill='%238a5a2b'/%3E%3Ccircle cx='26' cy='33' r='2.5' fill='%2315120D'/%3E%3Ccircle cx='38' cy='33' r='2.5' fill='%2315120D'/%3E%3Cellipse cx='32' cy='42' rx='6' ry='4.5' fill='%23E8C39E'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700;800;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;800;900&family=Archivo+Expanded:wght@700;800;900&family=Hanken+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <script>
 /* ntos-game.js — Nine to Survive: Your Number · pure game brain (no DOM)
  *
@@ -3271,6 +3271,38 @@ const FLOOR_STYLES = [
   { kind:'carpet',  a:'#E7C6A2', b:'#DFBB94', fleck:'rgba(21,18,13,0.07)' }    // BREAK CORNER
 ];
 const FLOOR_BASE = { kind:'carpet', a:'#E9E0C6', b:'#E2D8BB', fleck:'rgba(21,18,13,0.05)' };
+
+// ── WORLD TOKENS: the canvas "design tokens" ──────────────────────────────────
+// Every environmental surface colour (walls, glass, shadows, the atmospheric
+// overlay) is named here so the office can be re-lit from ONE place — the canvas
+// twin of :root in ntos-theme.css. Per-character / per-prop accents live in the
+// CAST and FURNITURE data tables above (a.color / f.color). LIGHT drives the
+// signature double key-light (warm 5pm gold vs. cold monitor-cyan) applied as an
+// overlay in render(); see DESIGN_SYSTEM.md.
+const WT = {
+  wallBackFace:'#E0D7C1', wallBackCap:'#CFC5A9',   // north wall — warm paper
+  wallSideFace:'#D5CBB2', wallSideCap:'#C2B89C',   // west wall
+  // the glass carries the signature collision: warm evening sky, cool glint
+  window:'#EAC98C', windowGlint:'rgba(143,183,201,0.5)',
+  floorSkirtA:'rgba(28,20,10,0.26)', floorSkirtB:'rgba(20,14,7,0.34)',
+  contactShadow:'rgba(34,22,10,0.22)',             // warm-tinted, never hard black
+  vignette:'rgba(20,14,7,0.16)',
+  // the double key-light (Bible §06/Phase 3): warm 5pm honey-gold flooding one
+  // side, cold monitor-cyan pushing back from the other. Painted as a soft-light
+  // overlay in render(); alphas ramp with time-of-day so the floor warms toward
+  // 5 o'clock. Re-light the whole office from HERE and nowhere else.
+  LIGHT:{
+    warm:'#F4DCA6', warmAt:[0.10,-0.04],           // gold, top-left of frame
+    cold:'#8FB7C9', coldAt:[1.02,1.06],            // cyan, bottom-right
+    warmBase:0.10, warmDay:0.17,                   // gold alpha = base + day·t
+    coldBase:0.16, coldDay:0.07,                   // cyan alpha = base − day·t
+    rimWarm:'#F4DCA6', rimCold:'#8FB7C9',           // per-object key/fill rim
+    monitorGlow:'#9FD0DE'                            // cool spill each screen casts
+  }
+};
+// real-frame time (ms), stashed by render() so draw helpers can animate without
+// threading it through every signature. Display-only; tests never call render().
+let _tMs = 0;
 // which zone owns each tile (computed once)
 const ZONE_MAP = (() => {
   const m = new Int8Array(GRID_W * GRID_H).fill(-1);
@@ -3302,12 +3334,12 @@ function wallSeg(ctx, ax, ay, bx, by, H, face, cap, hasWindow, z){
     ctx.moveTo(ix1, iy1 - H * 0.82); ctx.lineTo(ix2, iy2 - H * 0.82);
     ctx.lineTo(ix2, iy2 - H * 0.28); ctx.lineTo(ix1, iy1 - H * 0.28);
     ctx.closePath();
-    ctx.fillStyle = '#8FE4DA'; ctx.fill();
+    ctx.fillStyle = WT.window; ctx.fill();
     ctx.strokeStyle = 'rgba(21,18,13,0.28)'; ctx.lineWidth = 1.2 * z; ctx.stroke();
     ctx.beginPath();
     ctx.moveTo(ix1, iy1 - H * 0.82); ctx.lineTo(ix2, iy2 - H * 0.82);
     ctx.lineTo(ix2, iy2 - H * 0.60); ctx.lineTo(ix1, iy1 - H * 0.60);
-    ctx.closePath(); ctx.fillStyle = 'rgba(255,255,255,0.35)'; ctx.fill();
+    ctx.closePath(); ctx.fillStyle = WT.windowGlint; ctx.fill();
   }
 }
 
@@ -3327,8 +3359,9 @@ function drawChair(ctx, cam, gx, gy){
   ctx.fillStyle = '#5c5850'; ctx.fill();                       // seat
 }
 
-function render(w, ctx, cam, vw, vh){
+function render(w, ctx, cam, vw, vh, tMs){
   ctx.clearRect(0, 0, vw, vh);
+  _tMs = tMs || 0;
   const z = cam.z;
 
   const w2 = (TW / 2) * z, hh = (TH / 2) * z;
@@ -3387,11 +3420,11 @@ function render(w, ctx, cam, vw, vh){
     const [e2x, e2y] = proj(cam, GRID_W - 0.5, GRID_H - 0.5);
     const [e3x, e3y] = proj(cam, -0.5, GRID_H - 0.5);
     const D = 12 * z;
-    ctx.fillStyle = 'rgba(21,18,13,0.22)';
+    ctx.fillStyle = WT.floorSkirtA;
     ctx.beginPath();
     ctx.moveTo(e1x, e1y); ctx.lineTo(e2x, e2y); ctx.lineTo(e2x, e2y + D); ctx.lineTo(e1x, e1y + D);
     ctx.closePath(); ctx.fill();
-    ctx.fillStyle = 'rgba(21,18,13,0.30)';
+    ctx.fillStyle = WT.floorSkirtB;
     ctx.beginPath();
     ctx.moveTo(e2x, e2y); ctx.lineTo(e3x, e3y); ctx.lineTo(e3x, e3y + D); ctx.lineTo(e2x, e2y + D);
     ctx.closePath(); ctx.fill();
@@ -3426,14 +3459,14 @@ function render(w, ctx, cam, vw, vh){
     const [ax, ay] = proj(cam, x - 0.5, -0.5);
     const [bx, by] = proj(cam, x + 0.5, -0.5);
     if(bx < -TW * z || ax > vw + TW * z) continue;
-    wallSeg(ctx, ax, ay, bx, by, 48 * z, '#DAD2BD', '#C7BFA8', (x % 3) === 1, z);
+    wallSeg(ctx, ax, ay, bx, by, 48 * z, WT.wallBackFace, WT.wallBackCap, (x % 3) === 1, z);
   }
   for(let y = 0; y < GRID_H; y++){
     if(y === 16 || y === 17) continue;               // the EXIT breaks the wall
     const [ax, ay] = proj(cam, -0.5, y - 0.5);
     const [bx, by] = proj(cam, -0.5, y + 0.5);
     if(ax < -TW * z && bx < -TW * z) continue;
-    wallSeg(ctx, ax, ay, bx, by, 48 * z, '#CEC6AF', '#BBB39C', (y % 3) === 1, z);
+    wallSeg(ctx, ax, ay, bx, by, 48 * z, WT.wallSideFace, WT.wallSideCap, (y % 3) === 1, z);
   }
 
 
@@ -3472,11 +3505,40 @@ function render(w, ctx, cam, vw, vh){
     else drawActor(ctx, cam, item.a, w);
   });
 
-  // a soft vignette: fluorescent lighting, but make it cinematic
+  // ── the signature double key-light: warm 5pm gold vs. cold monitor-cyan ─────
+  // The single thing that must appear in every frame (Bible Phase 3). Painted as
+  // a soft-light overlay so it tints, not paints over. Alphas ramp with the day.
+  const L = WT.LIGHT;
+  if(L){
+    const dayT = Math.max(0, Math.min(1, w.clockMin / 480));   // 9:00 → 5:00
+    const breath = 1 + 0.06 * Math.sin((tMs || 0) / 2300);     // slow; never freezes
+    const diag = Math.hypot(vw, vh);
+    ctx.save();
+    ctx.globalCompositeOperation = 'soft-light';
+    const wg = ctx.createRadialGradient(vw * L.warmAt[0], vh * L.warmAt[1], 0,
+                                        vw * L.warmAt[0], vh * L.warmAt[1], diag * 0.95);
+    wg.addColorStop(0, hexA(L.warm, (L.warmBase + L.warmDay * dayT) * breath));
+    wg.addColorStop(1, hexA(L.warm, 0));
+    ctx.fillStyle = wg; ctx.fillRect(0, 0, vw, vh);
+    const cg = ctx.createRadialGradient(vw * L.coldAt[0], vh * L.coldAt[1], 0,
+                                        vw * L.coldAt[0], vh * L.coldAt[1], diag * 0.9);
+    cg.addColorStop(0, hexA(L.cold, L.coldBase - L.coldDay * dayT));
+    cg.addColorStop(1, hexA(L.cold, 0));
+    ctx.fillStyle = cg; ctx.fillRect(0, 0, vw, vh);
+    ctx.restore();
+    // a warm bloom hugging the top of frame: the sun coming through the glass,
+    // stronger as the day tips toward 5 o'clock
+    const sun = ctx.createLinearGradient(0, 0, 0, vh * 0.5);
+    sun.addColorStop(0, hexA(L.warm, 0.13 * dayT));
+    sun.addColorStop(1, hexA(L.warm, 0));
+    ctx.fillStyle = sun; ctx.fillRect(0, 0, vw, vh * 0.5);
+  }
+
+  // a soft vignette on top: fluorescent lighting, but make it cinematic
   const vg = ctx.createRadialGradient(vw / 2, vh / 2, Math.min(vw, vh) * 0.38,
                                       vw / 2, vh / 2, Math.max(vw, vh) * 0.78);
   vg.addColorStop(0, 'rgba(21,18,13,0)');
-  vg.addColorStop(1, 'rgba(21,18,13,0.10)');
+  vg.addColorStop(1, WT.vignette);
   ctx.fillStyle = vg;
   ctx.fillRect(0, 0, vw, vh);
 
@@ -3517,6 +3579,12 @@ function drawSpotRing(ctx, cam, tile, color, phase){
   ctx.strokeStyle = color; ctx.lineWidth = 2.6 * z; ctx.stroke();
 }
 
+// '#RRGGBB' + alpha → 'rgba(r,g,b,a)' — for the key-light gradients
+function hexA(hex, a){
+  const n = parseInt(hex.slice(1), 16);
+  return 'rgba(' + ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+}
+
 function shade(hex, f){
   const n = parseInt(hex.slice(1), 16);
   const r = Math.min(255, ((n >> 16) & 255) * f) | 0;
@@ -3548,6 +3616,19 @@ function drawPlant(ctx, cam, f, z){
 function drawMonitor(ctx, cam, f, hpx, z){
   const [mx, my] = proj(cam, f.x + f.w / 2 - 0.5, f.y + f.d / 2 - 0.5);
   const ty = my - hpx;
+  // the screen casts a cool pool on the desk — the cold key-light, in-world
+  const L = WT.LIGHT;
+  if(L){
+    const flick = 0.88 + 0.12 * Math.sin(_tMs / 680 + (f.x + f.y));
+    const g = ctx.createRadialGradient(mx, ty - 5 * z, 0, mx, ty - 5 * z, 24 * z);
+    g.addColorStop(0, hexA(L.monitorGlow, 0.26 * flick));
+    g.addColorStop(1, hexA(L.monitorGlow, 0));
+    const prev = ctx.globalCompositeOperation;
+    ctx.globalCompositeOperation = 'screen';
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.ellipse(mx, ty - 3 * z, 23 * z, 12 * z, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.globalCompositeOperation = prev;
+  }
   ctx.fillStyle = '#33302b';
   ctx.beginPath(); ctx.ellipse(mx, ty - 1 * z, 5 * z, 2.2 * z, 0, 0, Math.PI * 2); ctx.fill();
   ctx.fillRect(mx - 1.4 * z, ty - 9 * z, 2.8 * z, 8 * z);
@@ -3603,6 +3684,36 @@ function drawBox(ctx, cam, f, w){
     if(!(w && w.flags && w.flags.bradGone && f.id === 'desk-brad'))
       drawMonitor(ctx, cam, f, hpx, z);
   }
+  // signature desk clutter (Bible §18): each desk reads its owner before a word.
+  if(z > 0.62){
+    const fl = (fx, fy) => [dx + (cx - dx) * fx, dy + (cy - dy) * fx - hpx + fy * z]; // point on desktop
+    if(f.id === 'desk-marcus'){                 // coasting, beautifully: three mugs
+      [[0.30, 0], [0.52, 2], [0.72, -1]].forEach(([fx, oy], i) => {
+        const [mx, my] = fl(fx, oy);
+        ctx.fillStyle = i === 1 ? '#cdd3d8' : '#e8e2d4';
+        ctx.fillRect(mx - 2 * z, my - 4.5 * z, 4 * z, 4.5 * z);
+        ctx.fillStyle = 'rgba(21,18,13,0.25)';
+        ctx.fillRect(mx - 2 * z, my - 4.5 * z, 4 * z, 1 * z);
+      });
+    } else if(f.id === 'desk-priya'){           // the monument nobody else noticed
+      const [ax2, ay2] = fl(0.7, 0);
+      ctx.fillStyle = '#B98A4E';
+      ctx.beginPath(); ctx.moveTo(ax2, ay2 - 10 * z); ctx.lineTo(ax2 - 3.4 * z, ay2 - 2 * z);
+      ctx.lineTo(ax2 + 3.4 * z, ay2 - 2 * z); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#7d5c30'; ctx.fillRect(ax2 - 3.8 * z, ay2 - 2 * z, 7.6 * z, 2.4 * z);
+    } else if(f.id === 'desk-dennis'){          // 19 years of paper: a leaning stack
+      const [sx2, sy2] = fl(0.4, 0);
+      for(let i = 0; i < 7; i++){
+        ctx.fillStyle = i % 2 ? '#f3efe3' : '#e6e0d0';
+        ctx.fillRect(sx2 - 5 * z + (i % 2) * 0.9 * z, sy2 - 2 * z - i * 2.1 * z, 10 * z, 2.4 * z);
+      }
+    } else if(f.id === 'desk-kayla'){           // one small plant, quietly kept alive
+      const [kx, ky] = fl(0.72, 0);
+      ctx.fillStyle = '#A5623F'; ctx.fillRect(kx - 2.4 * z, ky - 4 * z, 4.8 * z, 4 * z);
+      ctx.fillStyle = '#5C8A54';
+      ctx.beginPath(); ctx.arc(kx, ky - 6 * z, 3.4 * z, 0, Math.PI * 2); ctx.fill();
+    }
+  }
   if(f.id === 'table-meet'){ drawChair(ctx, cam, 16, 6); drawChair(ctx, cam, 17, 6); }
   if(f.id === 'table-kitch'){ drawChair(ctx, cam, 22, 13); drawChair(ctx, cam, 23, 13); }
   if(f.id === 'couch'){
@@ -3625,6 +3736,22 @@ function drawBox(ctx, cam, f, w){
     ctx.fillStyle = '#D8443F'; ctx.fill();
     ctx.beginPath(); ctx.arc(cxm, cym, 3.8 * z, 0, Math.PI * 2);
     ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1 * z; ctx.stroke();
+    // steam curling off the pot — the one always-on sign of life
+    if(z > 0.6){
+      const [spx, spy] = proj(cam, f.x - 0.5, f.y - 0.5);
+      const sTop = spy - hpx - 3 * z;
+      for(let i = 0; i < 2; i++){
+        const ph = _tMs / 1000 + i * 1.7;
+        const rise = (ph % 2) / 2;                       // 0..1 loop
+        const sy = sTop - rise * 20 * z;
+        const sx = spx + Math.sin(ph * 2.3 + i) * 3 * z;
+        const alpha = 0.26 * (1 - rise) * Math.min(1, rise * 5);
+        ctx.beginPath();
+        ctx.ellipse(sx, sy, (1.5 + rise * 2) * z, (2 + rise * 2) * z, 0, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(245,242,235,' + alpha.toFixed(3) + ')';
+        ctx.fill();
+      }
+    }
   }
   if(f.id === 'fridge'){
     ctx.strokeStyle = 'rgba(21,18,13,0.4)'; ctx.lineWidth = 2 * z;
@@ -3716,7 +3843,7 @@ function drawActor(ctx, cam, a, w){
   const z = cam.z;
   const [px, py] = proj(cam, a.x, a.y);
   ctx.beginPath(); ctx.ellipse(px, py, 10 * z, 5 * z, 0, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(21,18,13,0.18)'; ctx.fill();
+  ctx.fillStyle = WT.contactShadow; ctx.fill();
   if(a.id === 'boss' && (a.mood === 'bad' || a.state === 'patrol')){
     ctx.beginPath(); ctx.ellipse(px, py, 14 * z, 7 * z, 0, 0, Math.PI * 2);
     ctx.strokeStyle = 'rgba(216,68,63,0.85)'; ctx.lineWidth = 2.5 * z; ctx.stroke();
@@ -3728,6 +3855,18 @@ function drawActor(ctx, cam, a, w){
   ctx.beginPath(); ctx.arc(px, py - 26 * z, dome, 0, Math.PI * 2);
   ctx.fillStyle = a.bear ? '#7d7871' : a.id === 'adam' ? '#EFD3AE' : '#E8C39E'; ctx.fill();
   ctx.strokeStyle = 'rgba(21,18,13,0.3)'; ctx.lineWidth = 1.1 * z; ctx.stroke();
+  // key/fill rim: the 5pm sun catches the upper-left of everyone; a cool screen-
+  // glow answers on the lower-right — the double key-light, on every silhouette
+  const RL = WT.LIGHT;
+  if(RL && z > 0.62){
+    ctx.save(); ctx.lineCap = 'round';
+    ctx.strokeStyle = hexA(RL.rimWarm, 0.5); ctx.lineWidth = 1.5 * z;
+    ctx.beginPath(); ctx.ellipse(px, py - 11 * z, 8 * z, 11 * z, 0, Math.PI * 0.78, Math.PI * 1.5); ctx.stroke();
+    ctx.beginPath(); ctx.arc(px, py - 26 * z, dome, Math.PI * 0.85, Math.PI * 1.55); ctx.stroke();
+    ctx.strokeStyle = hexA(RL.rimCold, 0.34); ctx.lineWidth = 1.3 * z;
+    ctx.beginPath(); ctx.ellipse(px, py - 11 * z, 8 * z, 11 * z, 0, Math.PI * -0.22, Math.PI * 0.34); ctx.stroke();
+    ctx.restore();
+  }
   if(a.id === 'adam'){
     // the shine: readable from across the floor
     ctx.beginPath(); ctx.ellipse(px - 2.2 * z, py - 29.5 * z, 2.6 * z, 1.5 * z, -0.5, 0, Math.PI * 2);
@@ -3852,177 +3991,292 @@ if (typeof window !== 'undefined') window.NtosWorld = NtosWorld;
 if (typeof module !== 'undefined' && module.exports) module.exports = NtosWorld;
 </script>
 <style>
+/* =============================================================================
+   NINE TO SURVIVE — THEME  (ntos-theme.css)
+   The single source of truth for the shell's (DOM) presentation.
+
+   HOW THIS FILE IS ORGANIZED
+     §0  DESIGN TOKENS      — every colour, font and shadow the UI uses (:root)
+     §1  RESET + BASE       — box model, body, typography primitives
+     §2  HUD / METERS       — the in-game overlay (§10 of the Visual Bible)
+     §3  ENCOUNTER CARD     — the dialogue/choice modal
+     §4  DAY REPORT (5:01)  — end-of-day summary
+     §5  START / END / MENUS
+     §6  THE OFFICE WORLD    — canvas frame + floating chrome (feed, toast, hint)
+     §7  STORY COLLECTION
+     §8  FIRE DRILL (crunch)
+     §9  RESPONSIVE
+
+   RULE OF THUMB
+     Change *look* here. Change *layout markup* in index.html. Change *gameplay*
+     in ntos-game.js / ntos-world.js. Never hand-edit ntos-standalone.html —
+     it is rebuilt by build_standalone.py, which inlines this file verbatim.
+
+     Ting edits §0 tokens + any block below to restyle. Kevin edits gameplay in
+     the .js modules. Neither needs to touch the other's territory.
+   ========================================================================== */
+
+/* ===========================================================================
+   §0  DESIGN TOKENS
+   The whole UI is built from these. Restyle the game by editing this block.
+   =========================================================================== */
 :root{
-  /* Nine to Survive brand: bright cyan page, cream "sticker" panels, heavy black ink. */
-  --bg:#41E3D6; --bg2:#37cdc1;
-  --panel:#F4EDDA; --panel2:#ECE4CD; --panel3:#E0D7BC;
-  --ink:#15120D; --muted:#5C5647; --muted2:#8A8371;
-  --standing:#2F6BE0; --standing-d:#2454b6;
-  --soul:#E8814C; --soul-d:#c1652f;
-  --money:#2E9E63; --money-d:#237c4c;
-  --danger:#D8443F; --ok:#3E9E5E;
-  --line:rgba(21,18,13,.14);
+  /* ── Nine to Survive · Visual Bible palette ──────────────────────────────
+     Paper + graphite. Warm 5pm sun colliding with cold monitor glow. ~90%
+     neutral; accents are rationed to where a meter or receipt actually lives.
+     Ember is the ONLY alarm colour — never decorative. */
+
+  /* the cinematic ground the menus float on (double key-light + grain go on top) */
+  --bg:#1c1710; --bg2:#0f0c08;
+
+  /* core neutrals — warm papers, never pure white */
+  --paper-hi:#FBF6EA;                          /* Paper Hi — brightest surfaces */
+  --panel:#F3EBDA; --panel2:#ECE3CE; --panel3:#E4D8C0;  /* Paper / Sand */
+  --ink:#15120C;                               /* Ink — darkest anchor */
+  --muted:#6E6960;                             /* Graphite — secondary text */
+  --muted2:#928D84;                            /* Ash — mid neutral */
+
+  /* meter accents (muted, rationed) */
+  --standing:#6E7398; --standing-d:#565b7d;    /* Slate — how they see you */
+  --soul:#5E9188;     --soul-d:#4a746c;        /* Verdigris — what's left of you */
+  --money:#B98A4E;    --money-d:#986f38;       /* Brass — the escape fund */
+  --danger:#B0553A;                            /* Ember — the alarm colour */
+  --folder:#D9BC82;                            /* Manila — receipts / leverage */
+  --ok:#5E9188;
+  --line:rgba(21,18,12,.14);
+
+  /* the signature double key-light, reused by menus + panels */
+  --key-warm:rgba(242,217,164,.85);            /* 5pm honey-gold */
+  --key-cold:rgba(143,183,201,.55);            /* cold monitor-cyan */
+
+  /* Type roles — the three Bible families, swapped in one place */
+  --font-display:'Archivo Expanded','Archivo',system-ui,sans-serif; /* titles, values */
+  --font-data:'Space Mono',ui-monospace,monospace;                  /* clocks, labels */
+  --font-body:'Hanken Grotesk',system-ui,sans-serif;                /* prose, dialogue */
+
+  /* Shape + shadow scale */
+  --r-card:16px; --r-panel:14px; --r-chip:12px; --r-pill:100px;
+  --shadow-card:0 24px 60px rgba(6,4,2,.55);
+  --shadow-panel:0 16px 40px rgba(6,4,2,.45);
+  --shadow-float:0 18px 46px rgba(6,4,2,.5);
+  --btn-drop:#000;                              /* hard bottom-shadow under buttons */
 }
+
+/* ===========================================================================
+   §1  RESET + BASE
+   =========================================================================== */
 *{box-sizing:border-box;margin:0;padding:0;}
 html{height:100%;}
 body{
-  background:var(--bg);color:var(--ink);
-  font-family:'Poppins',system-ui,sans-serif;-webkit-font-smoothing:antialiased;
+  /* the signature collision: warm 5pm gold flooding top-left, cold monitor-cyan
+     pushing back from bottom-right, over a deep warm ground. This is the game's
+     identity at thumbnail size — present on every menu, behind every card. */
+  background:
+    radial-gradient(130% 100% at 6% -8%, var(--key-warm) 0%, rgba(242,217,164,0) 46%),
+    radial-gradient(120% 100% at 104% 108%, var(--key-cold) 0%, rgba(143,183,201,0) 50%),
+    linear-gradient(158deg, var(--bg) 0%, var(--bg2) 100%);
+  background-attachment:fixed;
+  color:var(--ink);
+  font-family:var(--font-body);-webkit-font-smoothing:antialiased;
   min-height:100%;display:flex;padding:20px;
 }
+/* film-grain / paper tooth over the whole frame so nothing looks too clean */
+body::after{
+  content:"";position:fixed;inset:0;z-index:9998;pointer-events:none;
+  opacity:.05;mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+@media(prefers-reduced-motion:reduce){*{animation-duration:.001ms !important;}}
 /* margin:auto (not align-items:center) so a start screen taller than the
    viewport stays scrollable to its top instead of cropping the mascot */
 .stage{width:100%;max-width:460px;margin:auto;}
-.mono{font-family:'Poppins',sans-serif;}
+.mono{font-family:var(--font-data);}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit;}
 .hidden{display:none !important;}
 
-/* ---- HUD / meters ---- */
-.hud{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px 16px;margin-bottom:16px;}
+/* ===========================================================================
+   §2  HUD / METERS
+   =========================================================================== */
+/* the in-game HUD is a dark ink panel (Bible §10): warm text, rationed accents,
+   scoped brighter tokens so meters read against the ink. */
+.hud{
+  background:rgba(20,16,11,.90);color:var(--panel);
+  border:1px solid rgba(233,222,198,.14);border-radius:var(--r-panel);
+  padding:14px 16px 16px;margin-bottom:16px;
+  -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
+  /* on-ink accent tints (override the light-surface tokens for this subtree) */
+  --standing:#9096bd; --soul:#79b3a8; --money:#d6a568;
+  --muted:#b8af9d; --muted2:#9a917f; --line:rgba(233,222,198,.14);
+}
 .hudtop{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;}
-.sys{font-family:'Poppins',sans-serif;font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted2);}
-.clock{font-family:'Poppins',sans-serif;font-size:12px;letter-spacing:.05em;color:var(--muted);}
-.clock b{color:var(--ink);}
+.sys{font-family:var(--font-data);font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted2);}
+.sys::before{content:"● ";color:var(--danger);font-size:8px;vertical-align:1px;}
+.clock{font-family:var(--font-data);font-size:12px;letter-spacing:.05em;color:var(--muted);}
+.clock b{color:var(--paper-hi);}
 .meters{display:flex;flex-direction:column;gap:12px;}
 .meter .mrow{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px;}
-.meter .mname{font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.12em;text-transform:uppercase;}
+.meter .mname{font-family:var(--font-data);font-size:10px;letter-spacing:.12em;text-transform:uppercase;}
 .meter .msub{font-size:11px;color:var(--muted2);font-style:italic;}
-.meter .mval{font-family:'Poppins',sans-serif;font-weight:800;font-size:15px;font-variant-numeric:tabular-nums;position:relative;}
-.mtrack{height:9px;background:var(--panel3);border-radius:100px;overflow:hidden;}
-.mfill{height:100%;border-radius:100px;transition:width .55s cubic-bezier(.3,.9,.3,1);}
+.meter .mval{font-family:var(--font-display);font-weight:800;font-size:15px;font-variant-numeric:tabular-nums;position:relative;}
+.mtrack{height:9px;background:var(--panel3);border-radius:var(--r-pill);overflow:hidden;}
+.mfill{height:100%;border-radius:var(--r-pill);transition:width .55s cubic-bezier(.3,.9,.3,1);}
 .meter.standing .mname,.meter.standing .mval{color:var(--standing);}
 .meter.standing .mfill{background:linear-gradient(90deg,var(--standing-d),var(--standing));}
 .meter.soul .mname,.meter.soul .mval{color:var(--soul);}
 .meter.soul .mfill{background:linear-gradient(90deg,var(--soul-d),var(--soul));}
 .meter.money .mname,.meter.money .mval{color:var(--money);}
 .meter.money .mfill{background:linear-gradient(90deg,var(--money-d),var(--money));}
-.jobline{display:flex;justify-content:space-between;font-family:'Poppins',sans-serif;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink);margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line);}
+.jobline{display:flex;justify-content:space-between;font-family:var(--font-data);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--panel2);margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line);}
 .jobline .pay{color:var(--money);font-weight:700;}
 .taskline{margin-top:-4px;}
 .taskline #tasks-l{color:var(--danger);font-weight:700;}
 .taskline #tasks-r{color:var(--muted);}
-.statuspop .schat{display:inline-block;margin-top:10px;padding:8px 14px;border-radius:100px;background:var(--ink);color:var(--panel);font-size:12px;font-weight:600;cursor:pointer;}
-.delta{position:absolute;right:0;top:-16px;font-family:'Poppins',sans-serif;font-size:12px;font-weight:700;opacity:0;white-space:nowrap;}
+.statuspop .schat{display:inline-block;margin-top:10px;padding:8px 14px;border-radius:var(--r-pill);background:var(--ink);color:var(--panel);font-size:12px;font-weight:600;cursor:pointer;}
+.delta{position:absolute;right:0;top:-16px;font-family:var(--font-display);font-size:12px;font-weight:700;opacity:0;white-space:nowrap;}
 .delta.show{animation:floaty 1.1s ease-out forwards;}
 @keyframes floaty{0%{opacity:0;transform:translateY(4px);}20%{opacity:1;}100%{opacity:0;transform:translateY(-12px);}}
 
-/* ---- encounter card ---- */
-.card{background:linear-gradient(165deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:18px;padding:22px 22px 20px;box-shadow:0 20px 50px rgba(0,0,0,.4);}
-.tag{display:inline-block;font-family:'Poppins',sans-serif;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:100px;padding:4px 10px;margin-bottom:14px;}
-.etitle{font-family:'Poppins',sans-serif;font-weight:800;font-size:24px;line-height:1.08;letter-spacing:-.015em;margin-bottom:10px;}
+/* ===========================================================================
+   §3  ENCOUNTER CARD
+   =========================================================================== */
+.card{background:linear-gradient(165deg,var(--paper-hi),var(--panel));border:1px solid var(--line);border-radius:var(--r-card);padding:22px 22px 20px;box-shadow:var(--shadow-card);}
+.tag{display:inline-block;font-family:var(--font-data);font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);border:1px solid var(--line);border-radius:var(--r-pill);padding:4px 10px;margin-bottom:14px;}
+.etitle{font-family:var(--font-display);font-weight:800;font-size:24px;line-height:1.08;letter-spacing:-.015em;margin-bottom:10px;}
 .escene{font-size:15px;line-height:1.55;color:#3a352a;margin-bottom:20px;}
 .choices{display:flex;flex-direction:column;gap:10px;}
-.choice{text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px 16px;font-size:14.5px;line-height:1.4;color:var(--ink);transition:transform .1s,border-color .2s,background .2s;}
+.choice{text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:var(--r-chip);padding:14px 16px;font-size:14.5px;line-height:1.4;color:var(--ink);transition:transform .1s,border-color .2s,background .2s;}
 .choice:hover{border-color:var(--standing);background:var(--panel3);}
 .choice:active{transform:translateY(1px);}
 
 /* outcome */
 .outcome{margin-top:2px;}
 .oline{font-size:15px;line-height:1.6;color:#3a352a;font-style:italic;border-left:2px solid var(--soul);padding-left:14px;margin-bottom:20px;}
-.next{width:100%;padding:15px;border-radius:12px;background:var(--ink);color:var(--panel);font-weight:600;font-size:15px;transition:transform .1s,opacity .2s;}
-.next:hover{opacity:.9;} .next:active{transform:translateY(1px);}
+.next{width:100%;padding:15px;border-radius:var(--r-chip);background:var(--ink);color:var(--paper-hi);font-family:var(--font-display);font-weight:800;text-transform:uppercase;letter-spacing:.03em;font-size:14px;box-shadow:0 4px 0 var(--btn-drop);transition:transform .12s cubic-bezier(.3,.9,.3,1),box-shadow .12s;}
+.next:hover{transform:translateY(-1px);box-shadow:0 5px 0 var(--btn-drop);} .next:active{transform:translateY(3px);box-shadow:0 1px 0 var(--btn-drop);}
 
-/* ---- 5:01 PM day report ---- */
+/* ===========================================================================
+   §4  5:01 PM DAY REPORT
+   =========================================================================== */
 .report{margin:4px 0 16px;}
 .rrow{display:flex;justify-content:space-between;gap:14px;align-items:baseline;padding:9px 0;border-bottom:1px solid var(--line);font-size:13.5px;}
 .rrow .rk{color:var(--muted);}
-.rrow .rv{font-family:'Poppins',sans-serif;font-size:12.5px;font-weight:700;white-space:nowrap;}
+.rrow .rv{font-family:var(--font-data);font-size:12.5px;font-weight:700;white-space:nowrap;}
 .rv.plus{color:var(--money);} .rv.minus{color:var(--danger);} .rv.soulhit{color:var(--soul);} .rv.big{color:var(--standing);}
-.bankline{font-family:'Poppins',sans-serif;font-size:12px;letter-spacing:.06em;color:var(--muted);margin-bottom:18px;}
+.bankline{font-family:var(--font-data);font-size:12px;letter-spacing:.06em;color:var(--muted);margin-bottom:18px;}
 .bankline b{color:var(--money);font-size:14px;}
-.walkout{width:100%;padding:16px;border-radius:100px;background:var(--money);color:#fff;font-weight:700;font-size:16px;margin-bottom:10px;box-shadow:0 10px 26px rgba(35,124,76,.35);transition:transform .1s,opacity .2s;}
-.walkout:hover{opacity:.92;} .walkout:active{transform:translateY(1px);}
+.walkout{width:100%;padding:16px;border-radius:var(--r-pill);background:linear-gradient(180deg,#c99a5c,var(--money));color:#231605;font-family:var(--font-display);font-weight:800;text-transform:uppercase;letter-spacing:.02em;font-size:15px;margin-bottom:10px;box-shadow:0 4px 0 var(--money-d),0 14px 30px rgba(185,138,78,.3);transition:transform .12s cubic-bezier(.3,.9,.3,1),box-shadow .12s;}
+.walkout:hover{transform:translateY(-1px);box-shadow:0 5px 0 var(--money-d),0 16px 34px rgba(185,138,78,.34);} .walkout:active{transform:translateY(3px);box-shadow:0 1px 0 var(--money-d);}
 
-/* ---- start / end ---- */
-.screen{text-align:center;padding:6px 4px;}
-.mascot{width:156px;height:156px;border-radius:50%;background:var(--panel);display:flex;align-items:center;justify-content:center;margin:0 auto 20px;box-shadow:0 12px 34px rgba(21,18,13,.20);overflow:hidden;}
+/* ===========================================================================
+   §5  START / END / MENUS
+   =========================================================================== */
+/* menus sit on the dark cinematic ground: loose text goes light, but any light
+   panel nested inside restores ink text + graphite muted tokens. */
+.screen{text-align:center;padding:6px 4px;color:var(--paper-hi);--muted:#c7beac;--muted2:#a49a86;}
+.screen .legend,.screen .card,.screen .fm,.screen .storyunlock{color:var(--ink);--muted:#6E6960;--muted2:#928D84;}
+.mascot{width:156px;height:156px;border-radius:50%;background:radial-gradient(120% 120% at 30% 20%,var(--paper-hi),var(--panel3));display:flex;align-items:center;justify-content:center;margin:0 auto 20px;box-shadow:0 0 0 1px rgba(233,222,198,.12),0 18px 46px rgba(6,4,2,.55),0 0 60px -12px var(--key-warm);overflow:hidden;animation:ntsFloatY 7s ease-in-out infinite;}
+@keyframes ntsFloatY{0%,100%{transform:translateY(0);}50%{transform:translateY(-7px);}}
 .mascot img{width:88%;height:88%;object-fit:contain;}
 .mascot .fallback{font-size:72px;line-height:1;}
-.badge{font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.24em;text-transform:uppercase;color:var(--muted);margin-bottom:16px;}
-.big{font-family:'Poppins',sans-serif;font-weight:800;font-size:46px;line-height:.95;letter-spacing:-.03em;margin-bottom:6px;}
-.big .blue{color:var(--standing);} .big .amber{color:var(--soul);}
-.tagline{font-family:'Poppins',sans-serif;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:22px;}
+.badge{font-family:var(--font-data);font-size:10px;letter-spacing:.24em;text-transform:uppercase;color:var(--muted);margin-bottom:16px;}
+.big{font-family:var(--font-display);font-weight:900;font-size:44px;line-height:.92;letter-spacing:-.01em;text-transform:uppercase;margin-bottom:8px;color:var(--paper-hi);text-shadow:0 2px 22px rgba(0,0,0,.35);}
+.big .blue{color:#9aa0c6;} .big .amber{color:#d9a869;}
+.tagline{font-family:var(--font-data);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:22px;}
 .lede{font-size:15px;line-height:1.6;color:var(--muted);max-width:370px;margin:0 auto 22px;}
-.legend{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:0 auto 24px;max-width:380px;text-align:left;}
+.legend{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-panel);padding:16px 18px;margin:0 auto 24px;max-width:380px;text-align:left;}
 .leg{display:flex;gap:12px;align-items:flex-start;padding:9px 0;font-size:13.5px;line-height:1.45;}
 .leg:not(:last-child){border-bottom:1px solid var(--line);}
-.leg .k{flex-shrink:0;width:92px;text-align:center;font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:3px 0;border-radius:6px;margin-top:2px;font-weight:700;}
-.leg .k.s{background:rgba(94,154,214,.16);color:var(--standing);}
-.leg .k.so{background:rgba(232,129,76,.16);color:var(--soul);}
-.leg .k.m{background:rgba(46,158,99,.16);color:var(--money);}
+.leg .k{flex-shrink:0;width:92px;text-align:center;font-family:var(--font-data);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:3px 0;border-radius:6px;margin-top:2px;font-weight:700;}
+.leg .k.s{background:rgba(110,115,152,.18);color:var(--standing);}
+.leg .k.so{background:rgba(94,145,136,.18);color:var(--soul);}
+.leg .k.m{background:rgba(185,138,78,.18);color:var(--money-d);}
 .leg span{color:var(--muted);}
-.cta{display:inline-block;padding:16px 42px;border-radius:100px;background:var(--ink);color:var(--panel);font-weight:600;font-size:16px;transition:transform .1s,opacity .2s;}
-.cta:hover{opacity:.9;} .cta:active{transform:translateY(2px);}
-.resumebtn{background:var(--money);color:#fff;display:block;margin:10px auto 0;}
-.sharebtn{display:block;width:100%;margin-top:10px;padding:12px;border-radius:12px;border:1px solid var(--line);background:transparent;font-family:'Poppins',sans-serif;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);transition:color .2s,border-color .2s;}
+/* buttons drop onto the desk: hard bottom shadow, physical press (Bible §09) */
+.cta{display:inline-block;padding:16px 42px;border-radius:var(--r-pill);background:var(--ink);color:var(--paper-hi);font-family:var(--font-display);font-weight:800;text-transform:uppercase;letter-spacing:.02em;font-size:15px;box-shadow:0 4px 0 var(--btn-drop),var(--shadow-panel);transition:transform .12s cubic-bezier(.3,.9,.3,1),box-shadow .12s;}
+.cta:hover{transform:translateY(-1px);box-shadow:0 5px 0 var(--btn-drop),var(--shadow-panel);}
+.cta:active{transform:translateY(3px);box-shadow:0 1px 0 var(--btn-drop);}
+.resumebtn{background:var(--money);color:#231605;box-shadow:0 4px 0 var(--money-d),var(--shadow-panel);display:block;margin:12px auto 0;}
+.resumebtn:hover{box-shadow:0 5px 0 var(--money-d),var(--shadow-panel);}
+.resumebtn:active{box-shadow:0 1px 0 var(--money-d);}
+.sharebtn{display:block;width:100%;margin-top:10px;padding:12px;border-radius:var(--r-chip);border:1px solid var(--line);background:transparent;font-family:var(--font-data);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);transition:color .2s,border-color .2s;}
 .sharebtn:hover{color:var(--ink);border-color:var(--ink);}
 #sharebtn-end{max-width:300px;margin:14px auto 0;}
 
-/* ---- the office world ---- */
+/* end screen */
+.verdicttag{font-family:var(--font-data);font-size:10px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:14px;}
+.verdict{font-family:var(--font-display);font-weight:800;font-size:32px;line-height:1.05;letter-spacing:-.02em;margin-bottom:16px;}
+.vbody{font-size:15px;line-height:1.6;color:var(--muted);max-width:380px;margin:0 auto 24px;}
+.finalmeters{display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:330px;margin:0 auto 26px;}
+.fm{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-chip);padding:14px;}
+.fm .fl{font-family:var(--font-data);font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted2);margin-bottom:4px;}
+.fm .fv{font-family:var(--font-display);font-weight:800;font-size:26px;}
+.fm.s .fv{color:var(--standing);} .fm.so .fv{color:var(--soul);}
+.fm.m .fv{color:var(--money);} .fm.d .fv{color:var(--ink);}
+.foot{font-family:var(--font-data);font-size:10px;color:var(--muted2);letter-spacing:.14em;text-transform:uppercase;margin-top:24px;}
+
+/* ===========================================================================
+   §6  THE OFFICE WORLD  (canvas frame + floating chrome)
+   =========================================================================== */
 #play{position:fixed;inset:0;padding:0;}
 #world{position:absolute;inset:0;width:100%;height:100%;cursor:grab;touch-action:none;}
 #world.dragging{cursor:grabbing;}
 button{touch-action:manipulation;}
-.hudfloat{position:absolute;top:14px;left:14px;width:min(360px,calc(100vw - 28px));margin:0;box-shadow:0 14px 40px rgba(21,18,13,.25);z-index:5;}
-.hint{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:rgba(21,18,13,.6);background:rgba(244,237,218,.85);border:1px solid var(--line);border-radius:100px;padding:6px 14px;white-space:nowrap;z-index:5;}
+.hudfloat{position:absolute;top:14px;left:14px;width:min(360px,calc(100vw - 28px));margin:0;box-shadow:var(--shadow-float);z-index:5;}
+.hint{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);font-family:var(--font-data);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:rgba(21,18,13,.6);background:rgba(244,237,218,.85);border:1px solid var(--line);border-radius:var(--r-pill);padding:6px 14px;white-space:nowrap;z-index:5;}
 .overlay{position:fixed;inset:0;background:rgba(21,18,13,.45);display:flex;align-items:center;justify-content:center;padding:18px;z-index:20;}
 .overlay .card{width:min(460px,94vw);max-height:88vh;overflow-y:auto;}
-.statuspop{position:absolute;z-index:10;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 34px 12px 14px;width:238px;box-shadow:0 16px 40px rgba(21,18,13,.3);}
-.statuspop .sname{font-family:'Poppins',sans-serif;font-weight:800;font-size:16px;}
-.statuspop .srole{font-family:'Poppins',sans-serif;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted2);margin:2px 0 8px;}
+.statuspop{position:absolute;z-index:10;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-chip);padding:12px 34px 12px 14px;width:238px;box-shadow:0 16px 40px rgba(21,18,13,.3);}
+.statuspop .sname{font-family:var(--font-display);font-weight:800;font-size:16px;}
+.statuspop .srole{font-family:var(--font-data);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted2);margin:2px 0 8px;}
 .statuspop .sline{font-size:12.5px;line-height:1.45;color:#3a352a;font-style:italic;}
 .statuspop .sx{position:absolute;top:6px;right:10px;font-size:14px;color:var(--muted2);cursor:pointer;}
-.toast{position:absolute;bottom:52px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--panel);font-family:'Poppins',sans-serif;font-size:11.5px;border-radius:100px;padding:9px 18px;opacity:0;transition:opacity .25s;z-index:15;pointer-events:none;white-space:nowrap;}
+.toast{position:absolute;bottom:52px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--panel);font-family:var(--font-data);font-size:11.5px;border-radius:var(--r-pill);padding:9px 18px;opacity:0;transition:opacity .25s;z-index:15;pointer-events:none;white-space:nowrap;}
 .toast.show{opacity:1;}
-.mute{position:absolute;bottom:12px;right:14px;z-index:6;font-size:17px;background:rgba(244,237,218,.85);border:1px solid var(--line);border-radius:100px;width:38px;height:38px;line-height:1;}
+.mute{position:absolute;bottom:12px;right:14px;z-index:6;font-size:17px;background:rgba(244,237,218,.85);border:1px solid var(--line);border-radius:var(--r-pill);width:38px;height:38px;line-height:1;}
 /* the office feed: a small collapsible ticker, latest 3 lines */
-.feedbox{position:absolute;bottom:12px;left:14px;z-index:6;width:min(320px,calc(100vw - 90px));background:rgba(244,237,218,.92);border:1px solid var(--line);border-radius:12px;overflow:hidden;}
-.feedhead{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);cursor:pointer;user-select:none;}
+.feedbox{position:absolute;bottom:12px;left:14px;z-index:6;width:min(320px,calc(100vw - 90px));background:rgba(244,237,218,.92);border:1px solid var(--line);border-radius:var(--r-chip);overflow:hidden;}
+.feedhead{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;font-family:var(--font-data);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);cursor:pointer;user-select:none;}
 .feedhead b{color:var(--ink);}
 #feedlines{padding:0 12px 8px;}
 .feedbox.closed #feedlines{display:none;}
 .fline{font-size:11.5px;line-height:1.45;color:#3a352a;padding:3px 0;border-top:1px dashed var(--line);}
 .fline:first-child{border-top:none;}
-.fline .ft{font-family:'Poppins',sans-serif;font-size:9px;color:var(--muted2);margin-right:6px;}
+.fline .ft{font-family:var(--font-data);font-size:9px;color:var(--muted2);margin-right:6px;}
 /* full-day log on the 5:01 report */
 .feedlog{margin:2px 0 16px;border:1px solid var(--line);border-radius:10px;padding:8px 12px;background:var(--panel2);}
-.feedlog summary{font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);cursor:pointer;}
+.feedlog summary{font-family:var(--font-data);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);cursor:pointer;}
 .feedlog .fline{font-size:12px;}
-/* fire drill */
-.crunchcard .tag{color:var(--danger);border-color:var(--danger);}
-.crunchbar{height:14px;background:var(--panel3);border-radius:100px;overflow:hidden;margin:6px 0 8px;}
-#crunchfill{height:100%;width:100%;background:linear-gradient(90deg,#b3322e,var(--danger));border-radius:100px;}
-.crunchmeta{display:flex;justify-content:space-between;font-family:'Poppins',sans-serif;font-size:12px;font-weight:700;margin-bottom:14px;}
-#workbtn{background:var(--danger);color:#fff;font-weight:800;letter-spacing:.06em;}
-.crunchresult{font-size:14.5px;line-height:1.5;font-style:italic;border-left:2px solid var(--danger);padding-left:12px;margin:4px 0 14px;color:#3a352a;}
 
-/* the story collection */
-.storiesline{margin-top:18px;font-family:'Poppins',sans-serif;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);}
-.storybtn{font-family:'Poppins',sans-serif;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--standing);text-decoration:underline;cursor:pointer;}
+/* ===========================================================================
+   §7  STORY COLLECTION
+   =========================================================================== */
+.storiesline{margin-top:18px;font-family:var(--font-data);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);}
+.storybtn{font-family:var(--font-data);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--standing);text-decoration:underline;cursor:pointer;}
 #storylist{text-align:left;margin:6px 0 16px;max-height:56vh;overflow-y:auto;}
 .storyrow{display:flex;gap:12px;align-items:baseline;padding:9px 2px;border-bottom:1px solid var(--line);font-size:13.5px;}
-.storyrow .sn{font-family:'Poppins',sans-serif;font-weight:700;white-space:nowrap;}
+.storyrow .sn{font-family:var(--font-display);font-weight:700;white-space:nowrap;}
 .storyrow.found .sn{color:var(--money);}
 .storyrow.locked .sn{color:var(--muted2);letter-spacing:.14em;}
 .storyrow .sh{color:var(--muted);font-size:12px;font-style:italic;}
-.storyunlock{font-family:'Poppins',sans-serif;font-size:12.5px;font-weight:700;margin:4px auto;max-width:360px;padding:9px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);}
+.storyunlock{font-family:var(--font-display);font-size:12.5px;font-weight:700;margin:4px auto;max-width:360px;padding:9px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);}
 .storyunlock.new{color:var(--money);border-color:var(--money);}
 .storyunlock.old{color:var(--muted);}
 #storyunlocks{margin-bottom:18px;}
 
-/* end screen */
-.verdicttag{font-family:'Poppins',sans-serif;font-size:10px;letter-spacing:.2em;text-transform:uppercase;margin-bottom:14px;}
-.verdict{font-family:'Poppins',sans-serif;font-weight:800;font-size:32px;line-height:1.05;letter-spacing:-.02em;margin-bottom:16px;}
-.vbody{font-size:15px;line-height:1.6;color:var(--muted);max-width:380px;margin:0 auto 24px;}
-.finalmeters{display:grid;grid-template-columns:1fr 1fr;gap:12px;max-width:330px;margin:0 auto 26px;}
-.fm{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;}
-.fm .fl{font-family:'Poppins',sans-serif;font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted2);margin-bottom:4px;}
-.fm .fv{font-family:'Poppins',sans-serif;font-weight:800;font-size:26px;}
-.fm.s .fv{color:var(--standing);} .fm.so .fv{color:var(--soul);}
-.fm.m .fv{color:var(--money);} .fm.d .fv{color:var(--ink);}
-.foot{font-family:'Poppins',sans-serif;font-size:10px;color:var(--muted2);letter-spacing:.14em;text-transform:uppercase;margin-top:24px;}
+/* ===========================================================================
+   §8  FIRE DRILL (crunch)
+   =========================================================================== */
+.crunchcard .tag{color:var(--danger);border-color:var(--danger);}
+.crunchbar{height:14px;background:var(--panel3);border-radius:var(--r-pill);overflow:hidden;margin:6px 0 8px;}
+#crunchfill{height:100%;width:100%;background:linear-gradient(90deg,#b3322e,var(--danger));border-radius:var(--r-pill);}
+.crunchmeta{display:flex;justify-content:space-between;font-family:var(--font-data);font-size:12px;font-weight:700;margin-bottom:14px;}
+#workbtn{background:var(--danger);color:#fff;font-weight:800;letter-spacing:.06em;}
+.crunchresult{font-size:14.5px;line-height:1.5;font-style:italic;border-left:2px solid var(--danger);padding-left:12px;margin:4px 0 14px;color:#3a352a;}
 
-/* phones: shrink the HUD so the floor stays playable (last: wins specificity ties) */
+/* ===========================================================================
+   §9  RESPONSIVE
+   phones: shrink the HUD so the floor stays playable (last: wins specificity ties)
+   =========================================================================== */
 @media(max-width:420px){
   .hudfloat{top:8px;left:8px;width:calc(100vw - 16px);padding:9px 12px 11px;}
   .hudfloat .hudtop{margin-bottom:8px;}
@@ -4609,7 +4863,7 @@ function loop(t){
   $id('heatline').classList.toggle('hidden', !heatHot);
   if(heatHot) $id('heat-r').textContent =
     'HR ' + G.heatLevel(g, 'hr') + ' · Boss ' + G.heatLevel(g, 'boss') + ' · Brad ' + G.heatLevel(g, 'brad');
-  W.render(world, ctx, cam, window.innerWidth, window.innerHeight);
+  W.render(world, ctx, cam, window.innerWidth, window.innerHeight, t);
   rafId = requestAnimationFrame(loop);
 }
 
